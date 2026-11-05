@@ -22,14 +22,25 @@
  *   GET  /api/frontend/v1/stats/tool-call-error-rate
  *
  * Keyed endpoints reject anything but `expectedKey` with 401; when omitted,
- * any Bearer key is accepted (standalone/local smoke use).
+ * any Bearer key is accepted (standalone/local smoke use). The frontend
+ * routes under /api/frontend/v1 are the public website API: the real
+ * service serves them WITHOUT authentication (pi/api.ts calls them
+ * unauthenticated), so the mock must too — a 401 there silently disables
+ * just-in-time provider selection.
+ *
+ * Option `frontendStatsUnavailable: true` makes the two stats endpoints
+ * answer 404 (the catalog still answers 200). It mutates the MOCK side of
+ * the contract only, so a scenario can prove the selection path is skipped
+ * when the stats are unavailable.
  *
  * Every request is appended to `logPath` as one NDJSON row:
- *   { method, path, authorization, title, body? }
- * `authorization` is the raw Bearer value, `title` the x-title header;
- * `body` is the parsed JSON payload on POSTs. This log is the primary
- * assertion surface for key resolution, the public-vs-account masquerade
- * guard, and X-Title propagation.
+ *   { method, path, authorization, title, body?, status }
+ * `authorization` is the raw Bearer value, `title` the x-title header,
+ * `body` is the parsed JSON payload on POSTs, and `status` is the HTTP
+ * response status. The row is written once, after the response status is
+ * known. This log is the primary assertion surface for key resolution, the
+ * public-vs-account masquerade guard, X-Title propagation, and the
+ * frontend-stats calls behind just-in-time selection.
  *
  * Smoke (from repo root, bun or node):
  *   node -e 'import("./test/mock-openrouter.mjs").then(async (m) =>
@@ -97,22 +108,140 @@ function completionBody(model) {
   };
 }
 
-function authError(res) {
-  res.writeHead(401, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: { message: "Invalid or missing credentials", code: 401 } }));
+function authErrorBody() {
+  return JSON.stringify({ error: { message: "Invalid or missing credentials", code: 401 } });
 }
 
-function notFound(res) {
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: { message: "Not found", code: 404 } }));
+function notFoundBody() {
+  return JSON.stringify({ error: { message: "Not found", code: 404 } });
 }
+
+/** Frontend website API routes: served without a bearer token, like the real service. */
+const FRONTEND_PATHS = new Set([
+  "/api/frontend/v1/catalog/models",
+  "/api/frontend/v1/stats/endpoint",
+  "/api/frontend/v1/stats/tool-call-error-rate",
+]);
+
+const FRONTEND_STATS_PATHS = new Set([
+  "/api/frontend/v1/stats/endpoint",
+  "/api/frontend/v1/stats/tool-call-error-rate",
+]);
 
 function catalogResponse(models) {
   return JSON.stringify({ data: models });
 }
 
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
+/**
+ * Resolve one request to its response: { status, headers, body }. Kept
+ * separate from the server callback so the NDJSON log row can be written
+ * once, after the status is known.
+ */
+function resolveResponse({ req, path, url, body, bearer, expectedKey, frontendStatsUnavailable }) {
+  const method = req.method;
+
+  const authorized =
+    method === "GET" && path === "/api/v1/models"
+      ? true // public catalog: no auth required
+      : method === "GET" && FRONTEND_PATHS.has(path)
+        ? true // frontend website API: the real service serves it unauthenticated
+        : bearer !== null && (expectedKey === undefined || bearer === expectedKey);
+  if (!authorized) {
+    return { status: 401, headers: JSON_HEADERS, body: authErrorBody() };
+  }
+
+  // The frontend-stats outage simulation: the catalog still answers, the
+  // stats endpoints do not — the extension must then skip provider selection.
+  if (frontendStatsUnavailable && FRONTEND_STATS_PATHS.has(path)) {
+    return { status: 404, headers: JSON_HEADERS, body: notFoundBody() };
+  }
+
+  if (method === "GET") {
+    if (path === "/api/v1/models") {
+      return { status: 200, headers: JSON_HEADERS, body: catalogResponse(PUBLIC_MODELS) };
+    }
+    if (path === "/api/v1/models/user") {
+      return { status: 200, headers: JSON_HEADERS, body: catalogResponse(ACCOUNT_MODELS) };
+    }
+    if (path === "/api/v1/key") {
+      return {
+        status: 200,
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          data: {
+            label: "container-fixture",
+            limit: null,
+            limit_remaining: null,
+            usage: COST,
+            usage_daily: 0,
+            is_free_tier: false,
+          },
+        }),
+      };
+    }
+    if (path === "/api/v1/credits") {
+      return {
+        status: 200,
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ data: { total_credits: 25, total_usage: COST } }),
+      };
+    }
+    const endpointsMatch = /^\/api\/v1\/models\/([^/]+)\/([^/]+)\/endpoints$/.exec(path);
+    if (endpointsMatch) {
+      const rows = modelEndpointsFor(`${endpointsMatch[1]}/${endpointsMatch[2]}`);
+      if (rows === null) {
+        return { status: 404, headers: JSON_HEADERS, body: notFoundBody() };
+      }
+      return { status: 200, headers: JSON_HEADERS, body: JSON.stringify({ data: { endpoints: rows } }) };
+    }
+    if (path === "/api/frontend/v1/catalog/models") {
+      return {
+        status: 200,
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          data: [...PERMASLUGS.entries()].map(([slug, permaslug]) => ({ slug, permaslug })),
+        }),
+      };
+    }
+    if (path === "/api/frontend/v1/stats/endpoint") {
+      const rows = endpointStatsFor(url.searchParams.get("permaslug") ?? "");
+      if (rows === null) {
+        return { status: 404, headers: JSON_HEADERS, body: notFoundBody() };
+      }
+      return { status: 200, headers: JSON_HEADERS, body: JSON.stringify({ data: rows }) };
+    }
+    if (path === "/api/frontend/v1/stats/tool-call-error-rate") {
+      const series = toolCallErrorRateFor(url.searchParams.get("permaslug") ?? "");
+      if (series === null) {
+        return { status: 404, headers: JSON_HEADERS, body: notFoundBody() };
+      }
+      return { status: 200, headers: JSON_HEADERS, body: JSON.stringify(series) };
+    }
+  }
+
+  if (method === "POST" && (path === "/api/v1/chat/completions" || path === "/chat/completions")) {
+    const model = typeof body?.model === "string" ? body.model : MODEL_ID;
+    if (body?.stream === false) {
+      return { status: 200, headers: JSON_HEADERS, body: JSON.stringify(completionBody(model)) };
+    }
+    return {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+      body: sseBody(model),
+    };
+  }
+
+  return { status: 404, headers: JSON_HEADERS, body: notFoundBody() };
+}
+
 export async function startMockOpenRouter(options = {}) {
-  const { logPath, expectedKey, port = 0 } = options;
+  const { logPath, expectedKey, port = 0, frontendStatsUnavailable = false } = options;
   if (!logPath) throw new Error("startMockOpenRouter: logPath is required");
 
   const log = (row) => appendFile(logPath, `${JSON.stringify(row)}\n`);
@@ -136,108 +265,25 @@ export async function startMockOpenRouter(options = {}) {
       }
 
       void (async () => {
+        // Resolve the response first, then log it once with its status: the
+        // log row must describe the answer the client actually received.
+        const response = resolveResponse({ req, path, url, body, bearer, expectedKey, frontendStatsUnavailable });
+
         try {
-          await log({ method: req.method, path, authorization: bearer, title, body });
+          await log({
+            method: req.method,
+            path,
+            authorization: bearer,
+            title,
+            body,
+            status: response.status,
+          });
         } catch {
           // Logging must never take the mock down mid-scenario.
         }
 
-        const authorized =
-          req.method === "GET" && path === "/api/v1/models"
-            ? true // public catalog: no auth required
-            : bearer !== null && (expectedKey === undefined || bearer === expectedKey);
-        if (!authorized) {
-          authError(res);
-          return;
-        }
-
-        if (req.method === "GET") {
-          if (path === "/api/v1/models") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(catalogResponse(PUBLIC_MODELS));
-            return;
-          }
-          if (path === "/api/v1/models/user") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(catalogResponse(ACCOUNT_MODELS));
-            return;
-          }
-          if (path === "/api/v1/key") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              data: {
-                label: "container-fixture",
-                limit: null,
-                limit_remaining: null,
-                usage: COST,
-                usage_daily: 0,
-                is_free_tier: false,
-              },
-            }));
-            return;
-          }
-          if (path === "/api/v1/credits") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ data: { total_credits: 25, total_usage: COST } }));
-            return;
-          }
-          const endpointsMatch = /^\/api\/v1\/models\/([^/]+)\/([^/]+)\/endpoints$/.exec(path);
-          if (endpointsMatch) {
-            const rows = modelEndpointsFor(`${endpointsMatch[1]}/${endpointsMatch[2]}`);
-            if (rows === null) {
-              notFound(res);
-              return;
-            }
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ data: { endpoints: rows } }));
-            return;
-          }
-          if (path === "/api/frontend/v1/catalog/models") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              data: [...PERMASLUGS.entries()].map(([slug, permaslug]) => ({ slug, permaslug })),
-            }));
-            return;
-          }
-          if (path === "/api/frontend/v1/stats/endpoint") {
-            const rows = endpointStatsFor(url.searchParams.get("permaslug") ?? "");
-            if (rows === null) {
-              notFound(res);
-              return;
-            }
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ data: rows }));
-            return;
-          }
-          if (path === "/api/frontend/v1/stats/tool-call-error-rate") {
-            const series = toolCallErrorRateFor(url.searchParams.get("permaslug") ?? "");
-            if (series === null) {
-              notFound(res);
-              return;
-            }
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(series));
-            return;
-          }
-        }
-
-        if (req.method === "POST" && (path === "/api/v1/chat/completions" || path === "/chat/completions")) {
-          const model = typeof body?.model === "string" ? body.model : MODEL_ID;
-          if (body?.stream === false) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(completionBody(model)));
-            return;
-          }
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-          res.end(sseBody(model));
-          return;
-        }
-
-        notFound(res);
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
       })();
     });
   });

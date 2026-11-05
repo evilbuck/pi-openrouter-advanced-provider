@@ -242,10 +242,19 @@ Then reload the agent.
 ## Development
 
 ```
-npm install
+npm ci
 npm run typecheck
 npm test
 ```
+
+A synchronized `package-lock.json` is tracked, so `npm ci` installs the
+exact pinned dependency tree (and is what CI runs, with npm caching).
+
+`npm test` runs the unit tests on plain Node — no Bun needed. Node ≥ 22.18
+strips TypeScript natively (`scripts/run-tests.mjs` enforces this);
+`scripts/ts-resolve.mjs` remaps the sources' TypeScript-style `.js`
+specifiers to `.ts` the same way the extension loader resolves them at
+runtime. The full dual-host suite is in the container harness below.
 
 The typecheck maps `@earendil-works/pi-ai` the same way pi's extension
 loader resolves it at runtime, so the types you compile against are the

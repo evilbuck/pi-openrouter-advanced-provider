@@ -7,7 +7,7 @@ Notable changes to pi-openrouter-advanced-provider.
 ### omp compatibility
 
 The extension now runs on both hosts from one codebase: the pi coding agent
-(0.87, `@earendil-works/*`; verified on pi 1.5.0) and omp (18.x, `oh-my-pi`),
+(1.5.0, `@earendil-works/*`) and omp (18.x, `oh-my-pi`),
 a fork with a legacy-compat loader but divergent credential storage,
 registration validation, and transport dispatch.
 
@@ -45,9 +45,14 @@ What was done:
   A manual `/openrouter-sync` without a key now points at
   `/login openrouter`.
 - **Registration/build**: `omp.extensions` manifest field added; peer deps
-  pinned to the `^0.87.0` generation that actually serves (a stale lockfile
-  had typecheck resolving against pi-ai 0.74); `npm test` runs under Bun
-  (plain `node --test` cannot resolve the repo's `.js`→`.ts` specifiers).
+  retargeted to the `~1.5.0` minor line (the generation actually verified by
+  the container harness), with devDeps following so typecheck compiles
+  against pi-ai 1.5.0 types — a regenerated, tracked `package-lock.json`
+  now pins the dependency tree to that generation instead of the stale one
+  that had typecheck resolving against pi-ai 0.74; `npm test` runs on plain
+  Node (>= 22.18) via `scripts/run-tests.mjs`, with `scripts/ts-resolve.mjs`
+  remapping the sources' `.js`→`.ts` specifiers — no Bun required. Because
+  the lockfile is tracked, CI installs with `npm ci` and npm caching.
 
 Known limitation under omp: the just-in-time selection still pins routing
 per request, but the prewarm clamp of the registered context window to the

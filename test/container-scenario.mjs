@@ -21,11 +21,15 @@
  *      turns through the host binary:
  *        a. the fixture glm model  -> catalog key resolution, wrapper
  *           engagement (X-Title), registered row set + registry api identity,
- *           JIT selection observable (frontend stats fetched, provider pick
- *           on the wire), streamed response text;
+ *           JIT selection observable (frontend stats fetched with 200, and
+ *           the picked provider order on the wire), streamed response text;
  *        b. the router slug        -> usage.cost lands in session accounting
  *           (pi: message_end restore; omp: native wire stamp).
- *   2. no-key case — fresh unseeded home; /openrouter-sync must exit 0 with
+ *   2. stats-down case — the same fixture-model turn against a second mock
+ *      whose frontend stats endpoints answer 404: the completion still
+ *      succeeds and carries NO provider order (selection skipped). Proves
+ *      the keyed case's provider-order assertion is not vacuous.
+ *   3. no-key case — fresh unseeded home; /openrouter-sync must exit 0 with
  *      zero requests to the mock and no extension-registered rows.
  *
  * Assertion surfaces: the mock's NDJSON request log (per-run slices), the
@@ -68,7 +72,7 @@ const probePath = path.join(repoDir, "test", "fixtures", "probe-extension.mjs");
 const HOSTS = ["pi", "omp"];
 const SPAWN_TIMEOUT_MS = 240_000;
 const PROMPT = "Reply with exactly one short sentence.";
-const JIT_PICK = "lambda"; // test/fixtures/openrouter.mjs statsRows: row 1 wins deterministically.
+const JIT_PICK = "lambda"; // provider_slug of the winning fixture stats row (test/fixtures/openrouter.mjs statsRows: row 1 wins deterministically).
 
 function fail(message) {
   console.error(`container-scenario: ${message}`);
@@ -287,8 +291,101 @@ const isAccountCatalog = (row) => row.method === "GET" && row.path === "/api/v1/
 const isCompletion = (row) => row.method === "POST" && row.path.endsWith("/chat/completions");
 const isFrontend = (row) => row.path.startsWith("/api/frontend/");
 
+/** The frontend website APIs the JIT selection reads (pi/api.ts, unauthenticated). */
+const FRONTEND_CATALOG_PATH = "/api/frontend/v1/catalog/models";
+const FRONTEND_STATS_PATHS = ["/api/frontend/v1/stats/endpoint", "/api/frontend/v1/stats/tool-call-error-rate"];
+const isFrontendCatalog = (row) => row.method === "GET" && row.path === FRONTEND_CATALOG_PATH;
+const isFrontendStats = (row) => row.method === "GET" && FRONTEND_STATS_PATHS.includes(row.path);
+
 function completionSummary(rows) {
   return JSON.stringify(rows.map((r) => ({ model: r.body?.model, title: r.title, auth: r.authorization })));
+}
+
+/**
+ * JIT-selection assertions over one turn's mock log slice.
+ *
+ * The extension reads the frontend website APIs (catalog + both stats
+ * endpoints) without a bearer token, exactly like the real service — so
+ * those rows must be unauthenticated. `expectOrder` is the provider order
+ * the completion body must carry, or null when the turn must carry none
+ * (selection skipped). `expectStatsStatus` is the status the two stats
+ * endpoints must answer with.
+ */
+function assertJitSelection(check, slice, { expectOrder, expectStatsStatus }) {
+  const catalogRows = slice.filter(isFrontendCatalog);
+  const statsRows = slice.filter(isFrontendStats);
+
+  check.check(
+    "JIT fetched the frontend catalog",
+    catalogRows.length >= 1,
+    "GET /api/frontend/v1/catalog/models missing — selection never ran",
+  );
+  check.check(
+    "frontend catalog answered 200",
+    catalogRows.length >= 1 && catalogRows.every((r) => r.status === 200),
+    `catalog statuses seen: ${JSON.stringify(catalogRows.map((r) => r.status))}`,
+  );
+  check.check(
+    "JIT fetched the frontend endpoint stats",
+    statsRows.some((r) => r.path === "/api/frontend/v1/stats/endpoint"),
+    `stats paths seen: ${JSON.stringify(statsRows.map((r) => r.path))}`,
+  );
+  if (expectStatsStatus === 200) {
+    // Both stats endpoints are awaited on the success path, so both must be
+    // logged. On the failure path only the endpoint-stats read is guaranteed
+    // to have been logged (its sibling may still be in flight).
+    check.check(
+      "JIT fetched both frontend stats endpoints",
+      FRONTEND_STATS_PATHS.every((p) => statsRows.some((r) => r.path === p)),
+      `stats paths seen: ${JSON.stringify(statsRows.map((r) => r.path))}`,
+    );
+  }
+  check.check(
+    `frontend stats answered ${expectStatsStatus}`,
+    statsRows.length >= 1 && statsRows.every((r) => r.status === expectStatsStatus),
+    `stats statuses seen: ${JSON.stringify(statsRows.map((r) => ({ path: r.path, status: r.status })))}`,
+  );
+
+  const frontendRows = slice.filter(isFrontend);
+  const unauthenticated = frontendRows.every((r) => r.authorization === null);
+  check.check(
+    "frontend calls carried no bearer token",
+    unauthenticated,
+    `authorizations seen: ${JSON.stringify(frontendRows.map((r) => r.authorization))}`,
+  );
+
+  const glmPosts = slice.filter((r) => isCompletion(r) && r.body?.model === MODEL_ID);
+  if (glmPosts.length === 0) return null;
+  const post = glmPosts[glmPosts.length - 1];
+
+  if (expectOrder === null) {
+    check.check(
+      "completion carried no JIT provider order",
+      post.body?.provider?.order === undefined,
+      `wire provider=${JSON.stringify(post.body?.provider)} — selection must be skipped when the stats fail`,
+    );
+  } else {
+    // The frontend reads must precede the completion they steer.
+    const postIndex = slice.indexOf(post);
+    const frontendIndexes = frontendRows.map((r) => slice.indexOf(r)).filter((i) => i >= 0);
+    check.check(
+      "frontend reads preceded the fixture-model completion",
+      frontendIndexes.length > 0 && frontendIndexes.every((i) => i < postIndex),
+      `frontend row indexes ${JSON.stringify(frontendIndexes)} vs completion index ${postIndex}`,
+    );
+    check.check(
+      "completion carried the selected provider order",
+      JSON.stringify(post.body?.provider?.order) === JSON.stringify(expectOrder),
+      `wire provider.order=${JSON.stringify(post.body?.provider?.order)} expected ${JSON.stringify(expectOrder)}`,
+    );
+    check.check(
+      "completion allowed provider fallbacks",
+      post.body?.provider?.allow_fallbacks === true,
+      `wire provider=${JSON.stringify(post.body?.provider)}`,
+    );
+  }
+
+  return post;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,12 +529,13 @@ async function runKeyedCase(host, bin, baseUrl, logPath) {
         `x-title=${JSON.stringify(post.title)} expected ${JSON.stringify(APP_TITLE)}`,
       );
       check.check("fixture key used on completion", post.authorization === fixtureKey, `authorization=${JSON.stringify(post.authorization)}`);
-      check.check(
-        "JIT fetched the frontend catalog before completion",
-        slice.some((r) => r.path === "/api/frontend/v1/catalog/models"),
-        "GET /api/frontend/v1/catalog/models missing — selection never ran",
-      );
     }
+
+    // Real just-in-time verification: the frontend reads must have succeeded
+    // unauthenticated and the completion must carry the provider order the
+    // fixture stats produce (JIT_PICK). A logged-but-401 frontend read is
+    // NOT a selection — it silently yields nothing.
+    assertJitSelection(check, slice, { expectOrder: [JIT_PICK], expectStatsStatus: 200 });
 
     const glmMessages = assistantMessages(turn1.probeRecords).filter((m) => String(m.model ?? "").endsWith(MODEL_ID));
     check.check("probe saw the fixture-model assistant message", glmMessages.length >= 1,
@@ -515,6 +613,45 @@ async function runKeyedCase(host, bin, baseUrl, logPath) {
   return check;
 }
 
+/**
+ * Negative twin of the fixture-model turn: the frontend stats endpoints
+ * answer 404, so the extension must skip provider selection. The completion
+ * must still succeed and must carry NO provider order — if "provider order
+ * present" ever became unconditional, this case fails.
+ *
+ * It runs against the stats-down mock (own port, own log file) in its own
+ * isolated home, so neither the primary mock's log slice nor the host's
+ * cached dynamic models leak into the observation.
+ */
+async function runStatsDownCase(host, bin, statsDown) {
+  const check = new Checks(`${host}/stats-down`);
+  const { caseDir, agentDir } = makeCaseHome(host, "statsdown");
+  await seedCredentials(host, agentDir, fixtureKey);
+  const modelArg = `openrouter/${MODEL_ID}`;
+
+  const turn = await runTurn({
+    host,
+    bin,
+    caseDir,
+    agentDir,
+    mode: "statsdown",
+    modelArg,
+    prompt: PROMPT,
+    baseUrl: statsDown.baseUrl,
+    logPath: statsDown.logPath,
+  });
+  const ok = exitCheck(check, turn, `${host} stats-unavailable turn`);
+  if (ok) {
+    check.check(
+      `${host} stats-unavailable turn printed the fixture response`,
+      turn.result.stdout.includes(RESPONSE_TEXT),
+      `stdout tail: ${clip(turn.result.stdout)}`,
+    );
+    assertJitSelection(check, turn.logSlice, { expectOrder: null, expectStatsStatus: 404 });
+  }
+  return check;
+}
+
 async function runNoKeyCase(host, bin, baseUrl, logPath) {
   const check = new Checks(`${host}/no-key`);
   const { caseDir, agentDir } = makeCaseHome(host, "nokey");
@@ -550,18 +687,30 @@ async function runNoKeyCase(host, bin, baseUrl, logPath) {
 async function main() {
   const logPath = path.join(artifactsDir, "mock-openrouter.ndjson");
   fs.rmSync(logPath, { force: true });
+  // The stats-down twin: its own port and its own log file, so its requests
+  // never mix with the primary mock's slice.
+  const statsDownLogPath = path.join(artifactsDir, "mock-openrouter-stats-down.ndjson");
+  fs.rmSync(statsDownLogPath, { force: true });
 
   const mock = await startMockOpenRouter({ logPath, expectedKey: fixtureKey });
+  const statsDownMock = await startMockOpenRouter({
+    logPath: statsDownLogPath,
+    expectedKey: fixtureKey,
+    frontendStatsUnavailable: true,
+  });
+  const statsDown = { baseUrl: statsDownMock.baseUrl, logPath: statsDownLogPath };
   const allChecks = [];
   try {
     for (const host of hosts) {
       const bin = host;
       hostBin = bin;
       allChecks.push(await runKeyedCase(host, bin, mock.baseUrl, logPath));
+      allChecks.push(await runStatsDownCase(host, bin, statsDown));
       allChecks.push(await runNoKeyCase(host, bin, mock.baseUrl, logPath));
     }
   } finally {
     await mock.close();
+    await statsDownMock.close();
   }
 
   const passed = allChecks.reduce((n, c) => n + c.passed, 0);
