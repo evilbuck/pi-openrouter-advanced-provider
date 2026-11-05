@@ -40,6 +40,7 @@
  */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +63,15 @@ import { seedOmpDb } from "../scripts/seed-omp-db.mjs";
  * the mismatch spelled out.
  */
 const OPENROUTER_RECOVERY_API = "openrouter-recovery-completions";
+
+/**
+ * omp's cross-process permit segment for our provider id:
+ * base64url(sha256(provider)) — packages/ai/src/stream.ts:160-163
+ * (providerInFlightSegment) at v18.16.0. The lease root is HOME-scoped, so
+ * omp processes sharing one case home share their permits; the limit-one case
+ * samples that directory to prove limiting stays enforced.
+ */
+const OPENROUTER_PROVIDER_SEGMENT = crypto.createHash("sha256").update("openrouter").digest("base64url");
 
 // ---------------------------------------------------------------------------
 // Environment contract
@@ -195,7 +205,7 @@ function hostEnv({ caseDir, agentDir, probeArtifact, label, baseUrl }) {
 }
 
 /** Spawn a host one-shot; resolves { code, stdout, stderr, timedOut, missing }. */
-function runHost(bin, args, env, cwd) {
+function runHost(bin, args, env, cwd, timeoutMs = SPAWN_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -216,7 +226,7 @@ function runHost(bin, args, env, cwd) {
       timedOut = true;
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5_000).unref?.();
-    }, SPAWN_TIMEOUT_MS);
+    }, timeoutMs);
     killer.unref?.();
     const done = (code, missing = false) => {
       if (settled) return;
@@ -228,6 +238,99 @@ function runHost(bin, args, env, cwd) {
       stderr += `\nspawn error: ${error?.message ?? error}`;
       done(null, error?.code === "ENOENT");
     });
+    child.on("close", (code) => done(code));
+  });
+}
+
+/**
+ * Sample omp's cross-process permit leases for our provider while turns run.
+ * Each in-flight request holds one lease directory under the provider segment,
+ * so under `maxInFlightRequests.openrouter: 1` the sampled count must never
+ * exceed 1 — two leases at once would mean the recovery wrapper's nested
+ * dispatch took a second permit, i.e. a silent limit bypass.
+ *
+ * Real-interval polling is required here (no deterministic substitute): the
+ * observed state is live omp processes creating/removing lease directories on
+ * the real filesystem.
+ */
+function startLeaseSampler(caseDir, intervalMs = 25) {
+  // omp's permit root prefers XDG_STATE_HOME and falls back to the config root
+  // (~/.omp); sample every root that exists so the sampler stays correct
+  // whichever layout the container resolves.
+  const stateRoot = process.env.XDG_STATE_HOME;
+  const segmentDirs = [
+    path.join(caseDir, ".omp", "run", "provider-inflight", OPENROUTER_PROVIDER_SEGMENT),
+    ...(stateRoot ? [path.join(stateRoot, "omp", "run", "provider-inflight", OPENROUTER_PROVIDER_SEGMENT)] : []),
+  ];
+  let maxConcurrent = 0;
+  let samples = 0;
+  const timer = setInterval(() => {
+    let count = 0;
+    for (const segmentDir of segmentDirs) {
+      try {
+        count += fs.readdirSync(segmentDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+      } catch {
+        // No segment dir yet (nothing in flight): contributes zero.
+      }
+    }
+    samples += 1;
+    if (count > maxConcurrent) maxConcurrent = count;
+  }, intervalMs);
+  return {
+    stop: () => clearInterval(timer),
+    result: () => ({ maxConcurrent, samples }),
+  };
+}
+
+/**
+ * Spawn a host turn and SIGKILL it once `killWhen` sees the target state
+ * (bounded by capMs), then resolve with the outcome. Polls the mock log
+ * slice AND the probe artifact: the kill target is a live host process
+ * mid-request (permit held), and the probe's before_provider_request record
+ * is written at request START — mock log rows only appear once a response
+ * has finished, which is always too late to catch the request in flight.
+ */
+function runHostUntilKill(bin, args, env, cwd, { logPath, probePath = "", killWhen, capMs = 60_000, pollMs = 100 }) {
+  return new Promise((resolve) => {
+    const since = logSize(logPath);
+    let child;
+    try {
+      child = spawn(bin, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      resolve({ code: null, stdout: "", stderr: `spawn failed: ${error?.message}`, killed: false, killReason: "spawn-failed" });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (d) => { stdout += d; });
+    child.stderr?.on("data", (d) => { stderr += d; });
+    let settled = false;
+    let killed = false;
+    let killReason = "exited-first";
+    const startedAt = Date.now();
+    const poll = setInterval(() => {
+      const records = [...readLogSlice(logPath, since), ...readNdjson(probePath)];
+      if (killWhen(records)) {
+        killed = true;
+        killReason = "request-observed";
+        clearInterval(poll);
+        child.kill("SIGKILL");
+      } else if (Date.now() - startedAt > capMs) {
+        killed = true;
+        killReason = "cap";
+        clearInterval(poll);
+        child.kill("SIGKILL");
+      }
+    }, pollMs);
+    const done = (code) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      resolve({ code, stdout, stderr, killed, killReason });
+    };
+    child.on("error", (error) => { stderr += `\nspawn error: ${error?.message ?? error}`; done(null); });
     child.on("close", (code) => done(code));
   });
 }
@@ -680,6 +783,163 @@ async function runNoKeyCase(host, bin, baseUrl, logPath) {
   return check;
 }
 
+/**
+ * omp keyed case under `providers.maxInFlightRequests.openrouter = 1` — the
+ * review's P1 deadlock regression. omp reads providers.* settings from the
+ * agent dir's config.yml (the same store the credential seeding targets), so
+ * the limit is written into this case home before any turn. Prewarm +
+ * fixture-model turn + router turn must COMPLETE within the bounded timeout:
+ * the pre-fix deadlock blocked every request before any HTTP call, so a
+ * timeout here is the regression signal.
+ *
+ * Enforcement stays observable: two omp processes sharing this case home share
+ * the HOME-scoped lease root, and the sampled lease count must never exceed 1
+ * (two leases at once would mean the recovery wrapper's nested dispatch took a
+ * second permit for the provider the enclosing dispatch already holds). A
+ * mid-completion SIGKILL leaves a dead-pid lease that omp's stale-lease
+ * reaping must clear: a follow-up turn in the same case home must complete
+ * promptly, proving cancellation does not wedge the permit store.
+ */
+async function runLimitOneCase(host, bin, baseUrl, logPath) {
+  const check = new Checks(`${host}/limit-one`);
+  const { caseDir, agentDir } = makeCaseHome(host, "limit-one");
+  await seedCredentials(host, agentDir, fixtureKey);
+  fs.writeFileSync(
+    path.join(agentDir, "config.yml"),
+    ["providers:", "  maxInFlightRequests:", "    openrouter: 1", ""].join("\n"),
+  );
+
+  // Fail loudly if the limit never reached omp: every later assertion in this
+  // case would silently exercise no permit path at all.
+  const configProbe = await runHost(
+    "omp",
+    ["config", "get", "providers.maxInFlightRequests"],
+    hostEnv({ caseDir, agentDir, probeArtifact: "", label: "limit-one-config", baseUrl }),
+    caseDir,
+    60_000,
+  );
+  check.check(
+    `${host} limit-one setting visible to omp`,
+    configProbe.code === 0 && configProbe.stdout.includes('"openrouter":1'),
+    `exit=${configProbe.code} stdout=${JSON.stringify(clip(configProbe.stdout, 300))} stderr=${JSON.stringify(clip(configProbe.stderr, 300))}`,
+  );
+
+  const modelArg = `openrouter/${MODEL_ID}`;
+  const prewarm = await runTurn({ host, bin, caseDir, agentDir, mode: "limit-one-prewarm", modelArg, prompt: "Warm the selected model.", baseUrl, logPath });
+  exitCheck(check, prewarm, `${host} limit-one prewarm (deadlock regression = timeout)`);
+  const turn1 = await runTurn({ host, bin, caseDir, agentDir, mode: "limit-one", modelArg, prompt: PROMPT, baseUrl, logPath });
+  const ok1 = exitCheck(check, turn1, `${host} limit-one fixture-model turn`);
+  if (ok1) {
+    check.check(
+      `${host} limit-one completion reached the mock`,
+      turn1.logSlice.some((r) => isCompletion(r) && r.body?.model === MODEL_ID),
+      `completion POSTs: ${completionSummary(turn1.logSlice.filter(isCompletion))}`,
+    );
+    const streamed = assistantMessages(turn1.probeRecords).filter((m) => String(m.model ?? "").endsWith(MODEL_ID));
+    check.check(
+      `${host} limit-one assistant message completed`,
+      streamed.length >= 1 && streamed[streamed.length - 1].stopReason === "stop",
+      `probe messages: ${JSON.stringify(assistantMessages(turn1.probeRecords).map((m) => ({ model: m.model, stopReason: m.stopReason, errorMessage: m.errorMessage })))}`,
+    );
+  }
+
+  const turn2 = await runTurn({ host, bin, caseDir, agentDir, mode: "limit-one-router", modelArg: `openrouter/${ROUTER_ID}`, prompt: PROMPT, baseUrl, logPath });
+  const ok2 = exitCheck(check, turn2, `${host} limit-one router turn`);
+  if (ok2) {
+    check.check(
+      `${host} limit-one router completion reached the mock`,
+      turn2.logSlice.some((r) => isCompletion(r) && r.body?.model === ROUTER_ID),
+      `completion POSTs: ${completionSummary(turn2.logSlice.filter(isCompletion))}`,
+    );
+  }
+
+  // --- Enforcement: two concurrent omp processes, one shared lease root ---
+  const agentB = path.join(caseDir, "agent-b");
+  fs.mkdirSync(agentB, { recursive: true });
+  await seedCredentials(host, agentB, fixtureKey);
+  const sampler = startLeaseSampler(caseDir);
+  const [concurrentA, concurrentB] = await Promise.all([
+    runTurn({ host, bin, caseDir, agentDir, mode: "limit-one-concurrent-a", modelArg, prompt: PROMPT, baseUrl, logPath }),
+    runTurn({ host, bin, caseDir, agentDir: agentB, mode: "limit-one-concurrent-b", modelArg, prompt: PROMPT, baseUrl, logPath }),
+  ]);
+  sampler.stop();
+  const sampling = sampler.result();
+  const okA = exitCheck(check, concurrentA, `${host} limit-one concurrent turn A`);
+  const okB = exitCheck(check, concurrentB, `${host} limit-one concurrent turn B`);
+  check.check(
+    `${host} limit-one sampled permits never exceed the limit of one`,
+    sampling.maxConcurrent <= 1,
+    `max sampled leases=${sampling.maxConcurrent} over ${sampling.samples} samples (limit 1; two leases at once = nested bypass)`,
+  );
+  if (okA && okB) {
+    check.check(
+      `${host} limit-one both concurrent turns posted a completion`,
+      concurrentA.logSlice.some(isCompletion) && concurrentB.logSlice.some(isCompletion),
+      `A POSTs=${concurrentA.logSlice.filter(isCompletion).length} B POSTs=${concurrentB.logSlice.filter(isCompletion).length}`,
+    );
+  }
+
+  // --- Permit release after cancellation: bounded kill path ---
+  const killLogPath = path.join(artifactsDir, "mock-openrouter-limit-one-kill.ndjson");
+  fs.rmSync(killLogPath, { force: true });
+  // A FRESH agent dir for the killed turn: omp caches the provider config
+  // (including baseUrl) with its dynamic-models catalog, so reusing the
+  // original agent dir would send the completion to the primary mock and the
+  // kill log would never see it (same leak the stats-down case isolates).
+  // The kill fires on the probe's before_provider_request record — written at
+  // request START, while the dispatch still holds our provider's permit — so
+  // the SIGKILL lands mid-request instead of racing an already-finished run
+  // (mock log rows only appear after a response completes). The kill turn
+  // shares the case home, so its permit lease lands in the same cross-process
+  // lease root.
+  const agentKill = path.join(caseDir, "agent-kill");
+  fs.mkdirSync(agentKill, { recursive: true });
+  await seedCredentials(host, agentKill, fixtureKey);
+  const killMock = await startMockOpenRouter({
+    logPath: killLogPath,
+    expectedKey: fixtureKey,
+    // Hold the completion RESPONSE open: the kill fires on the probe's
+    // request-start record, and the delay guarantees the SIGKILL lands while
+    // the host is still awaiting the response (permit held), not after it.
+    completionDelayMs: 4_000,
+  });
+  const killProbeArtifact = path.join(artifactsDir, `${host}-limit-one-kill-probe.ndjson`);
+  let killed;
+  try {
+    killed = await runHostUntilKill(bin, [
+      "--no-extensions",
+      "-e", path.join(repoDir, "pi/index.ts"),
+      "-e", probePath,
+      "--model", modelArg,
+      "-p", PROMPT,
+    ], hostEnv({ caseDir, agentDir: agentKill, probeArtifact: killProbeArtifact, label: `${host}/limit-one-kill`, baseUrl: killMock.baseUrl }), caseDir, {
+      logPath: killLogPath,
+      probePath: killProbeArtifact,
+      killWhen: (records) =>
+        records.some((r) => r.type === "before_provider_request" && String(r.model ?? "").endsWith(MODEL_ID)),
+    });
+  } finally {
+    await killMock.close();
+  }
+  check.check(
+    `${host} limit-one kill fired on a live host mid-request (permit held)`,
+    killed.killReason === "request-observed",
+    `exit=${killed.code} killReason=${killed.killReason} stderr=${JSON.stringify(clip(killed.stderr, 300))}`,
+  );
+
+  const followUp = await runTurn({ host, bin, caseDir, agentDir, mode: "limit-one-followup", modelArg, prompt: PROMPT, baseUrl, logPath });
+  const okFollow = exitCheck(check, followUp, `${host} limit-one follow-up turn after kill`);
+  if (okFollow) {
+    check.check(
+      `${host} limit-one follow-up completion reached the mock`,
+      followUp.logSlice.some(isCompletion),
+      `completion POSTs: ${completionSummary(followUp.logSlice.filter(isCompletion))}`,
+    );
+  }
+
+  return check;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -707,6 +967,9 @@ async function main() {
       allChecks.push(await runKeyedCase(host, bin, mock.baseUrl, logPath));
       allChecks.push(await runStatsDownCase(host, bin, statsDown));
       allChecks.push(await runNoKeyCase(host, bin, mock.baseUrl, logPath));
+      // The omp-only permit case: pi's pi-ai has no provider permit, so the
+      // limit-one config and the cross-process lease sampling are omp-only.
+      if (host === "omp") allChecks.push(await runLimitOneCase(host, bin, mock.baseUrl, logPath));
     }
   } finally {
     await mock.close();

@@ -23,7 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONFIG_DIR_NAME, readStoredCredential } from "@earendil-works/pi-coding-agent";
-import { streamSimple as hostStreamSimple } from "@earendil-works/pi-ai/compat";
+import { streamSimple as hostStreamSimple, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 
 export type Runtime = "omp" | "pi";
 
@@ -159,4 +159,59 @@ export async function bootstrapApiKey(): Promise<string | undefined> {
  */
 export function completionsStreamSimple(): typeof hostStreamSimple {
   return hostStreamSimple;
+}
+
+/**
+ * Stream options that only omp's pi-ai understands. pi-ai 1.5 has neither
+ * field, so every read below goes through this structural view — the same
+ * one-cast-at-the-boundary pattern the rest of the adapter uses.
+ */
+export interface HostPermitOptions {
+  /**
+   * omp's per-provider in-flight limit map. When present it REPLACES the
+   * configured global map for that call (packages/ai/src/stream.ts:137-146,
+   * v18.16.0): `options?.maxInFlightRequests ?? configuredProviderMaxInFlightRequests`.
+   */
+  maxInFlightRequests?: Record<string, number>;
+  /**
+   * omp's limiter hands this flag to a custom-API dispatch: true exactly when
+   * the enclosing dispatch acquired a permit for this provider
+   * (packages/ai/src/stream.ts:1401-1404, `waitForTerminalDrain: limited`).
+   */
+  waitForTerminalDrain?: boolean;
+}
+
+/**
+ * Scope the per-call provider in-flight limits for the recovery wrapper's
+ * nested dispatch.
+ *
+ * omp's permit is keyed by PROVIDER NAME (resolveProviderInFlightLimit reads
+ * `model.provider`) and is acquired by the dispatcher around EVERY dispatch of
+ * that provider — both the custom-API dispatch that enters this extension's
+ * wrapper and the nested native dispatch the wrapper performs. The enclosing
+ * permit is held until the wrapper's stream ends, so a nested dispatch that
+ * resolves a limit for the same provider waits for a slot only the enclosing
+ * dispatch can release: a self-deadlock, reproduced with the real omp 18.16.0
+ * binary under `providers.maxInFlightRequests.openrouter = 1` (see
+ * .context/2026-11-04.6-dual-host-harness/research-omp-transport.md).
+ *
+ * The host announces "the enclosing dispatch holds a permit for this provider"
+ * via `waitForTerminalDrain === true`. In that case the options handed to the
+ * nested dispatch drop OUR provider's entry from the per-call limit map, so
+ * the nested dispatch resolves no limit for it and takes no second permit.
+ * Every other provider's entry is preserved, the host's global configured map
+ * is never consulted by the nested dispatch while a per-call map is present,
+ * and the enclosing dispatch keeps holding and enforcing the configured limit
+ * for the whole request: one permit per logical request — not a bypass.
+ */
+export function scopedNestedPermitOptions(
+  options: SimpleStreamOptions | undefined,
+  provider: string,
+): SimpleStreamOptions | undefined {
+  if (!isOmp() || !options) return options;
+  const host = options as SimpleStreamOptions & HostPermitOptions;
+  if (host.waitForTerminalDrain !== true) return options;
+  const scoped: Record<string, number> = { ...(host.maxInFlightRequests ?? {}) };
+  delete scoped[provider];
+  return { ...options, maxInFlightRequests: scoped } as SimpleStreamOptions;
 }

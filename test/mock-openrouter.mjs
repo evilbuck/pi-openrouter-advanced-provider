@@ -33,6 +33,20 @@
  * the contract only, so a scenario can prove the selection path is skipped
  * when the stats are unavailable.
  *
+ * Discovery-failure options (all additive; the default behaviour with only
+ * `expectedKey` is unchanged):
+ *   - `accountCatalogFail: true`   GET /api/v1/models/user answers 503.
+ *   - `accountCatalogStatus: <n>`  Status for that failure (default 503).
+ *   - `accountCatalogDelayMs: <n>` Delay before the account catalog answers.
+ *   - `keyDelays: { [key]: ms }`   Per-credential delay (account catalog).
+ *   - `keyFailures: { [key]: n }`  Per-credential failure status.
+ *   - `keyCatalogs: { [key]: rows }` Per-credential account catalog. The
+ *     built-in entry maps FIXTURE_KEY_B to ACCOUNT_MODELS_B so an overlap
+ *     scenario can tell the two credentials' rows apart.
+ *   - `acceptKeys: [key, ...]`     Extra bearer values accepted on keyed
+ *     endpoints (FIXTURE_KEY_B is accepted by default so an overlap scenario
+ *     can drive two credentials at once).
+ *
  * Every request is appended to `logPath` as one NDJSON row:
  *   { method, path, authorization, title, body?, status }
  * `authorization` is the raw Bearer value, `title` the x-title header,
@@ -56,6 +70,8 @@ import {
   MODEL_ID,
   RESPONSE_TEXT,
   ACCOUNT_MODELS,
+  ACCOUNT_MODELS_B,
+  FIXTURE_KEY_B,
   PUBLIC_MODELS,
   PERMASLUGS,
   endpointStatsFor,
@@ -139,15 +155,33 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
  * separate from the server callback so the NDJSON log row can be written
  * once, after the status is known.
  */
-function resolveResponse({ req, path, url, body, bearer, expectedKey, frontendStatsUnavailable }) {
+function resolveResponse({
+  req,
+  path,
+  url,
+  body,
+  bearer,
+  expectedKey,
+  frontendStatsUnavailable,
+  acceptKeys,
+  accountCatalogFail,
+  accountCatalogStatus,
+  keyDelays,
+  keyFailures,
+  keyCatalogs,
+}) {
   const method = req.method;
+  const accepted =
+    expectedKey === undefined
+      ? true
+      : bearer === expectedKey || (Array.isArray(acceptKeys) && acceptKeys.includes(bearer));
 
   const authorized =
     method === "GET" && path === "/api/v1/models"
       ? true // public catalog: no auth required
       : method === "GET" && FRONTEND_PATHS.has(path)
         ? true // frontend website API: the real service serves it unauthenticated
-        : bearer !== null && (expectedKey === undefined || bearer === expectedKey);
+        : bearer !== null && accepted;
   if (!authorized) {
     return { status: 401, headers: JSON_HEADERS, body: authErrorBody() };
   }
@@ -163,7 +197,25 @@ function resolveResponse({ req, path, url, body, bearer, expectedKey, frontendSt
       return { status: 200, headers: JSON_HEADERS, body: catalogResponse(PUBLIC_MODELS) };
     }
     if (path === "/api/v1/models/user") {
-      return { status: 200, headers: JSON_HEADERS, body: catalogResponse(ACCOUNT_MODELS) };
+      // Per-credential failure injection: a scenario can make one
+      // credential's account catalog fail while another one still answers.
+      const keyFailure = keyFailures && bearer ? keyFailures[bearer] : undefined;
+      if (keyFailure !== undefined) {
+        return { status: keyFailure, headers: JSON_HEADERS, body: notFoundBody() };
+      }
+      if (accountCatalogFail) {
+        return {
+          status: accountCatalogStatus ?? 503,
+          headers: JSON_HEADERS,
+          body: notFoundBody(),
+        };
+      }
+      const catalog = keyCatalogs && bearer ? keyCatalogs[bearer] : undefined;
+      return {
+        status: 200,
+        headers: JSON_HEADERS,
+        body: catalogResponse(catalog ?? ACCOUNT_MODELS),
+      };
     }
     if (path === "/api/v1/key") {
       return {
@@ -241,7 +293,20 @@ function resolveResponse({ req, path, url, body, bearer, expectedKey, frontendSt
 }
 
 export async function startMockOpenRouter(options = {}) {
-  const { logPath, expectedKey, port = 0, frontendStatsUnavailable = false } = options;
+  const {
+    logPath,
+    expectedKey,
+    port = 0,
+    frontendStatsUnavailable = false,
+    accountCatalogFail = false,
+    accountCatalogStatus = 503,
+    accountCatalogDelayMs = 0,
+    completionDelayMs = 0,
+    keyDelays = {},
+    keyFailures = {},
+    keyCatalogs = { [FIXTURE_KEY_B]: ACCOUNT_MODELS_B },
+    acceptKeys = [],
+  } = options;
   if (!logPath) throw new Error("startMockOpenRouter: logPath is required");
 
   const log = (row) => appendFile(logPath, `${JSON.stringify(row)}\n`);
@@ -265,9 +330,35 @@ export async function startMockOpenRouter(options = {}) {
       }
 
       void (async () => {
+        // Per-credential delay: lets a scenario hold one credential's catalog
+        // open while another credential's refresh completes first. The
+        // completion delay holds the completion RESPONSE open so a scenario
+        // can catch (and kill) a host mid-request, permit still held.
+        const isCompletionPath = req.method === "POST" && (path === "/api/v1/chat/completions" || path === "/chat/completions");
+        const delayMs = isCompletionPath
+          ? completionDelayMs
+          : (keyDelays[bearer] ?? (path === "/api/v1/models/user" ? accountCatalogDelayMs : 0));
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+
         // Resolve the response first, then log it once with its status: the
         // log row must describe the answer the client actually received.
-        const response = resolveResponse({ req, path, url, body, bearer, expectedKey, frontendStatsUnavailable });
+        const response = resolveResponse({
+          req,
+          path,
+          url,
+          body,
+          bearer,
+          expectedKey,
+          frontendStatsUnavailable,
+          acceptKeys,
+          accountCatalogFail,
+          accountCatalogStatus,
+          keyDelays,
+          keyFailures,
+          keyCatalogs,
+        });
 
         try {
           await log({
@@ -277,6 +368,9 @@ export async function startMockOpenRouter(options = {}) {
             title,
             body,
             status: response.status,
+            // Completion timestamp (epoch ms). Additive: a scenario can order
+            // concurrent requests and measure overlap without wall-clock sleeps.
+            at: Date.now(),
           });
         } catch {
           // Logging must never take the mock down mid-scenario.
@@ -310,9 +404,12 @@ export async function startMockOpenRouter(options = {}) {
 
 /** Re-exports so a single import of this module covers the whole contract. */
 export {
+  ACCOUNT_MODELS,
+  ACCOUNT_MODELS_B,
   APP_TITLE,
   COST,
   FIXTURE_KEY,
+  FIXTURE_KEY_B,
   MODEL_ID,
   RESPONSE_TEXT,
   ROUTER_ID,

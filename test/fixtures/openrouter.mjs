@@ -12,6 +12,13 @@
 /** Bearer key the mock accepts on keyed /api/v1 endpoints; also seeded into auth stores. */
 export const FIXTURE_KEY = "sk-or-test-container";
 
+/**
+ * Second fixture bearer key, used by the discovery-overlap scenario to give
+ * two concurrent refreshes two DIFFERENT credentials. It is additive: FIXTURE_KEY
+ * keeps its exact meaning, so every existing case is unaffected.
+ */
+export const FIXTURE_KEY_B = "sk-or-test-container-b";
+
 /** The glm-like fixture model a scenario turn targets. */
 export const MODEL_ID = "z-ai/glm-container";
 
@@ -124,6 +131,18 @@ export const ACCOUNT_MODELS = [
   // signal (no ":thinking"/"-r1"/"o1-"/"qwq-"/"reasoner" id/name markers), so
   // all ten classify as agentic-reasoning models.
 ].map((row) => ({ ...row, supported_parameters: [...row.supported_parameters, "reasoning_effort"] }));
+
+/**
+ * Account catalog served to FIXTURE_KEY_B. Distinct ids from ACCOUNT_MODELS so
+ * a scenario can prove which credential's rows ended up in the host registry.
+ * Same shape (ten agentic rows) as ACCOUNT_MODELS, so counts stay comparable.
+ */
+export const ACCOUNT_MODELS_B = ACCOUNT_MODELS.map((row) => ({
+  ...row,
+  id: `${row.id}-b`,
+  canonical_slug: `${row.canonical_slug ?? `${row.id}-20261001`}-b`,
+  name: `${row.name} B`,
+}));
 
 /** Public catalog served by GET /api/v1/models — deliberately disjoint from the account list. */
 export const PUBLIC_MODELS = [

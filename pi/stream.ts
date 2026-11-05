@@ -28,7 +28,7 @@ import {
   type SimpleStreamOptions,
   type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
-import { completionsStreamSimple, isOmp } from "./platform.ts";
+import { completionsStreamSimple, isOmp, scopedNestedPermitOptions } from "./platform.ts";
 import { OPENROUTER_BASE_URL } from "./types.ts";
 import {
   driveRecoveryLoop,
@@ -166,8 +166,15 @@ export function streamOpenRouterWithRecovery(
   // No provider guard: foreign openai-completions providers cannot reach this
   // wrapper — under omp the provider is registered with the unique recovery
   // api id, under pi registration is per-provider. An injected delegate
-  // (argument !== defaultDelegate) is used verbatim, as before.
+  // (argument !== defaultDelegate) is used verbatim, as before — it stands in
+  // for the host dispatcher, so it receives the same scoped options.
   const isInjected = delegate !== defaultDelegate;
+
+  // Under omp the enclosing dispatch already holds our provider's permit for
+  // this whole request; the nested dispatch must not ask for it again (see
+  // scopedNestedPermitOptions). Applied to every delegate invocation, default
+  // or injected; under pi this is an identity pass-through.
+  const hostOptions = scopedNestedPermitOptions(options, model.provider);
 
   const stream = createAssistantMessageEventStream();
 
@@ -175,7 +182,7 @@ export function streamOpenRouterWithRecovery(
     try {
       const state: RecoveryState = { signatureRetried: false };
       const initial: AttemptSpec<SimpleStreamOptions | undefined, Message[]> = {
-        options,
+        options: hostOptions,
         messages: context.messages,
       };
       const applyRetry = (
