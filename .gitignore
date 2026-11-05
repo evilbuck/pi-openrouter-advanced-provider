@@ -2,3 +2,6 @@ node_modules/
 package-lock.json
 *.log
 .worktrees/
+
+# local context planning - so as not to accidentally pollute other branches
+.context

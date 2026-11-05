@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
   PROVIDER_NAME,
   type ProviderRegistration,
@@ -22,6 +22,7 @@ import { scoreProviders } from "./scoring.js";
 import { clampedSelectionLimits } from "./limits.js";
 import { buildStandaloneProviderConfig, streamOpenRouterWithRecovery } from "./stream.js";
 import { restoreRouterCost, wrapRouterCostFetch } from "./auto-cost.js";
+import { bootstrapApiKey, initHost, isOmp } from "./platform.ts";
 import {
   DEFAULT_SELECTION,
   isVariantModelId,
@@ -62,27 +63,39 @@ function emitMessage(pi: ExtensionAPI, text: string) {
 }
 
 export default async function openrouterModelsExtension(pi: ExtensionAPI) {
+  initHost(pi);
+
   // Pi prices router slugs from their zero-cost catalog entry rather than the
   // model OpenRouter served. Capture its billed SSE cost once per response and
   // replace the finalized message so session totals see the real amount.
-  const key = Symbol.for("pi-openrouter-advanced-provider:router-cost");
-  const globals = globalThis as any;
-  const costState: {
-    wrapped: boolean;
-    captures: Map<string, Promise<number | undefined>>;
-  } = globals[key] ??= { wrapped: false, captures: new Map() };
-  if (!costState.wrapped) {
-    // Reload intentionally keeps this first wrapper: it closes over the
-    // original module's parsing code, so wrapper changes need a process
-    // restart. Re-wrapping on every load would stack wrappers instead.
-    globalThis.fetch = wrapRouterCostFetch(globalThis.fetch, costState.captures);
-    costState.wrapped = true;
+  //
+  // Under omp this is skipped entirely: omp natively stamps assistant
+  // usage.cost.total from the wire for the "openrouter" provider, so no
+  // fetch wrapping or message_end restore is needed.
+  if (!isOmp()) {
+    const key = Symbol.for("pi-openrouter-advanced-provider:router-cost");
+    type RouterCostState = {
+      wrapped: boolean;
+      captures: Map<string, Promise<number | undefined>>;
+    };
+    const globals = globalThis as unknown as Record<symbol, RouterCostState | undefined>;
+    const costState: RouterCostState = (globals[key] ??= {
+      wrapped: false,
+      captures: new Map(),
+    });
+    if (!costState.wrapped) {
+      // Reload intentionally keeps this first wrapper: it closes over the
+      // original module's parsing code, so wrapper changes need a process
+      // restart. Re-wrapping on every load would stack wrappers instead.
+      globalThis.fetch = wrapRouterCostFetch(globalThis.fetch, costState.captures);
+      costState.wrapped = true;
+    }
+    pi.on("message_end", async (event) => {
+      if (event.message.role !== "assistant") return;
+      const message = await restoreRouterCost(event.message, costState.captures);
+      if (message) return { message };
+    });
   }
-  pi.on("message_end", async (event) => {
-    if (event.message.role !== "assistant") return;
-    const message = await restoreRouterCost(event.message, costState.captures);
-    if (message) return { message };
-  });
 
   // ---------- Per-model config overrides ----------
 
@@ -173,9 +186,9 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
     // Adjust the model's registered context window to the picked provider's,
     // so budgeting/autocompact reflect the provider that will actually serve.
-    const registered = ctx.modelRegistry?.getRegisteredProviderConfig?.(PROVIDER_NAME);
-    const models = registered?.models as any[] | undefined;
-    const entry = models?.find((m) => m.id === modelId);
+    const models = getSnapshot().models.slice();
+    if (models.length === 0) return;
+    const entry = models.find((m) => m.id === modelId);
     if (!entry) return;
     if (!baseRegistration.has(modelId)) {
       baseRegistration.set(modelId, { contextWindow: entry.contextWindow, maxTokens: entry.maxTokens });
@@ -186,12 +199,16 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     // raised cap makes pi's request budgeting send max_tokens the serving
     // provider rejects. The registered base is the verified ceiling.
     const next = clampedSelectionLimits(base, result);
-    if (entry.contextWindow !== next.contextWindow || entry.maxTokens !== next.maxTokens) {
+    if (!isOmp() && (entry.contextWindow !== next.contextWindow || entry.maxTokens !== next.maxTokens)) {
       entry.contextWindow = next.contextWindow;
       entry.maxTokens = next.maxTokens;
-      // Re-registration merges defined values over the previous registration
-      // and preserves undefined ones (api/auth/refreshModels all survive).
-      pi.registerProvider(PROVIDER_NAME, { models } as any);
+      // Full re-registration from the committed snapshot: pi replaces the
+      // model list wholesale, so the snapshot list plus the clamped entry is
+      // the complete new registration. Under omp the registration is dynamic
+      // (fetchDynamicModels) — there is no static list to re-register, and
+      // re-registering would need a pinned key, so the clamp-to-picked-
+      // provider feature is pi-only in this pass.
+      registerStandalone(models, apiKey);
     }
 
     if (result.advisory) {
@@ -309,43 +326,74 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   // ---------- Provider registration (standalone catalog) ----------
 
   /**
-   * Models registration plus the failure-recovery streamSimple wrapper for
-   * thought signatures. Pi merges re-registrations key by key — defined
-   * values win, undefined values preserve what is beneath — so leaving
-   * apiKey/baseUrl undefined keeps the builtin defaults in standalone
+   * Pi-only static models registration plus the failure-recovery streamSimple
+   * wrapper for thought signatures. Pi merges re-registrations key by key —
+   * defined values win, undefined values preserve what is beneath — so
+   * leaving apiKey/baseUrl undefined keeps the builtin defaults in standalone
    * mode. Attaching api and streamSimple routes completions requests through
    * the recovery wrapper while leaving non-completions APIs to base dispatch.
+   * Under omp registration is dynamic (see bootstrapPlainSync); this function
+   * must not be called there.
    */
-  function registerStandalone(models: ProviderRegistration["models"]) {
-    pi.registerProvider(PROVIDER_NAME, buildStandaloneProviderConfig(models) as any);
+  function registerStandalone(models: ProviderRegistration["models"], apiKey: string | undefined) {
+    // Host-normalized registration shape: the builder's structural mirror is
+    // a subset of each host's ProviderConfig; this is the one boundary cast.
+    pi.registerProvider(
+      PROVIDER_NAME,
+      buildStandaloneProviderConfig(models, { apiKey }) as ProviderConfig,
+    );
   }
 
   /**
-   * Load-time key resolution: env first, then pi's auth store (~/.pi/agent/
-   * auth.json, where /login stores keys — the registry is not reachable this
-   * early). Without a key the account catalog is unreachable, and falling
-   * back to the public catalog would silently swap account-scoped data (BYOK
-   * models, fallback aliases) for the generic list — so no key means no
-   * bootstrap registration.
+   * Dynamic-models fetcher handed to omp via the provider registration. Does
+   * what syncPlain's body does minus registerProvider: refreshes the request
+   * config, clears stale selections, rebuilds the catalog, and commits the
+   * snapshot. Omp calls this with the host-resolved key each time, so
+   * rotation/logout flow naturally. Failures PROPAGATE: returning a stale
+   * snapshot would report the previous key's account catalog as a successful
+   * discovery for the new key (and mask ordinary 5xx/timeouts). The host's
+   * discovery machinery owns failure handling — omp keeps its cached rows
+   * and surfaces the error; syncPlain's refreshProvider call reports it.
    */
-  function bootstrapApiKey(): string | undefined {
-    if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
-    try {
-      const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
-      if (!fs.existsSync(authPath)) return undefined;
-      const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
-      const entry = auth?.openrouter;
-      if (typeof entry === "string" && entry.startsWith("sk-or-")) return entry;
-      if (typeof entry?.key === "string" && entry.key.startsWith("sk-or-")) return entry.key;
-    } catch {
-      // unreadable auth store — fall through to undefined
+  async function syncFetcher(
+    apiKey: string | undefined,
+  ): Promise<NonNullable<ProviderRegistration["models"]>> {
+    if (!apiKey) {
+      // Omp invokes the fetcher even unauthenticated. Returning the public
+      // catalog would present generic models as this provider's account
+      // rows; an empty set honestly reports "nothing available" and leaves
+      // omp's builtin openrouter rows in place.
+      return [];
     }
-    return undefined;
+    const generation = nextGeneration();
+    refreshRequestConfig();
+    clearSelections();
+    baseRegistration.clear();
+    const result = await buildPlainSync(apiKey ?? undefined, false, requestConfig);
+    if (isStale(generation)) {
+      // A newer sync superseded this one — still return the freshly built
+      // rows (omp needs rows to register), just skip the commit.
+      return result.models;
+    }
+    commitSnapshot(generation, result.models);
+    return result.models;
   }
 
   async function bootstrapPlainSync() {
+    if (isOmp()) {
+      // Dynamic registration under omp: register ONCE at load with no
+      // network fetch and no key check — the registration carries
+      // fetchDynamicModels instead of a static list, and omp invokes it with
+      // the HOST-RESOLVED key during its own startup refresh. No key is
+      // pinned here, so /logout and key rotation stay authoritative.
+      pi.registerProvider(
+        PROVIDER_NAME,
+        buildStandaloneProviderConfig(undefined, { fetchDynamicModels: syncFetcher }) as ProviderConfig,
+      );
+      return;
+    }
     const generation = nextGeneration();
-    const apiKey = bootstrapApiKey();
+    const apiKey = await bootstrapApiKey();
     if (!apiKey) return; // session_start syncs with the registry key
 
     try {
@@ -356,7 +404,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
       if (isStale(generation)) return;
       commitSnapshot(generation, result.models);
-      registerStandalone(result.models);
+      registerStandalone(result.models, apiKey);
       // The registered snapshot changed: selections (and their recorded base
       // limits) from the previous catalog are stale.
       clearSelections();
@@ -371,10 +419,34 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   await bootstrapPlainSync();
 
   async function syncPlain(ctx: any, silent = false, force = false) {
+    if (isOmp()) {
+      // Dynamic registration: no re-registration with a pinned key. Ask the
+      // host registry to re-run fetchDynamicModels — strategy "online"
+      // forces a refresh past the 24h dynamic-models cache — then report
+      // counts from the committed snapshot the fetcher updated.
+      if (!silent) ctx.ui.notify("Fetching OpenRouter models...", "info");
+      try {
+        await ctx.modelRegistry.refreshProvider(PROVIDER_NAME, "online");
+        const snapshot = getSnapshot();
+        if (!silent) ctx.ui.notify(`OpenRouter: ${snapshot.models.length} models synced`, "info");
+        notifyConfigWarnings(ctx);
+      } catch (err: any) {
+        if (!silent) ctx.ui.notify(`OpenRouter sync failed: ${err?.message}`, "error");
+      }
+      return;
+    }
+
     const generation = nextGeneration();
 
     try {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
+      if (!apiKey) {
+        // No key: registering the public catalog would masquerade generic
+        // models as the account-scoped list this extension exists to provide.
+        // Pi's builtin OpenRouter list stays untouched.
+        if (!silent) ctx.ui.notify("No OpenRouter API key configured — run /login openrouter", "warning");
+        return;
+      }
       if (!silent) ctx.ui.notify("Fetching OpenRouter models...", "info");
 
       refreshRequestConfig();
@@ -383,7 +455,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
       if (isStale(generation)) return;
       commitSnapshot(generation, result.models);
-      registerStandalone(result.models);
+      registerStandalone(result.models, apiKey);
       // The registered snapshot changed: stale selections (and their recorded
       // base limits) from the previous catalog must not survive the sync.
       clearSelections();
@@ -523,6 +595,34 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       }
       const tier = tierBySession.get(resolveSessionId(ctx) ?? "") ?? null;
       lines.push(`Cost tier: ${tier ? `${tier} (cost band ${COST_TIER_BANDS[tier]})` : "workspace default"}`);
+
+      if (isOmp()) {
+        // Wrapper-engagement proof: the registered rows must carry the
+        // recovery api id, otherwise requests bypass the recovery wrapper.
+        // Feature-detected — pi's registry lacks getProviderModels.
+        try {
+          const registry = ctx.modelRegistry as {
+            getProviderModels?: (providerId: string) => unknown;
+          };
+          const rows = registry.getProviderModels?.(PROVIDER_NAME);
+          if (Array.isArray(rows)) {
+            const apis = new Set(
+              rows
+                .filter((r): r is Record<string, unknown> => r !== null && typeof r === "object" && "api" in r)
+                .map((r) => String(r.api)),
+            );
+            lines.push(`Registered rows: ${rows.length} — apis: ${[...apis].join(", ") || "none"}`);
+            const active = (ctx as { model?: { id?: unknown } }).model;
+            const activeId = typeof active?.id === "string" ? active.id : undefined;
+            const activeRow = activeId ? rows.find((r) => (r as { id?: unknown })?.id === activeId) : undefined;
+            if (activeRow) {
+              lines.push(`Active model row api: ${String((activeRow as Record<string, unknown>).api)}`);
+            }
+          }
+        } catch {
+          // status command must never throw
+        }
+      }
 
       if (snapshot.timestamp > 0) {
         const ageMin = Math.round((Date.now() - snapshot.timestamp) / 60000);

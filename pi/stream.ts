@@ -1,8 +1,17 @@
 /**
  * streamSimple wrapper for the OpenRouter provider registration. Delegates to
- * pi-ai's built-in stream implementation and adds automatic recovery for
- * invalid thought signature errors when OpenRouter fails over between backing
+ * the host's stream implementation and adds automatic recovery for invalid
+ * thought signature errors when OpenRouter fails over between backing
  * providers.
+ *
+ * Handoff design: under omp, the provider is registered with the UNIQUE api
+ * id "openrouter-recovery-completions", so omp's dispatcher routes ONLY our
+ * models to this wrapper (foreign openai-completions providers never reach
+ * it). The wrapper then clones the model with api "openai-completions" and
+ * calls the host dispatcher via platform.ts's completionsStreamSimple() —
+ * which under omp is the pi-ai root dispatcher running built-in dispatch WITH
+ * mapOptionsForApi, and under pi is the built-in openai-completions simple
+ * transport directly.
  *
  * At most one retry per request, and never after any content event has been
  * forwarded. When the retry fails, the freshest error event is surfaced.
@@ -10,7 +19,6 @@
 
 import {
   createAssistantMessageEventStream,
-  openAICompletionsApi,
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
@@ -20,6 +28,8 @@ import {
   type SimpleStreamOptions,
   type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
+import { completionsStreamSimple, isOmp } from "./platform.ts";
+import { OPENROUTER_BASE_URL } from "./types.ts";
 import {
   driveRecoveryLoop,
   stripReasoningReplaySignatures,
@@ -27,6 +37,12 @@ import {
   type RecoveryAction,
   type RecoveryState,
 } from "./recovery.ts";
+
+/**
+ * Unique api id used to register our wrapper under omp, so omp's dispatcher
+ * routes only our models here instead of every openai-completions provider.
+ */
+export const OPENROUTER_RECOVERY_API = "openrouter-recovery-completions";
 
 export type StreamSimpleDelegate = (
   model: Model<Api>,
@@ -39,10 +55,21 @@ export function defaultDelegate(
   context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  if (isOmp()) {
+    // The host dispatcher keys both registry lookup and built-in selection off
+    // `api`; clone to the built-in id, the clone is otherwise identical.
+    if (model.api !== OPENROUTER_RECOVERY_API) {
+      throw new Error(
+        `OpenRouter recovery wrapper expects api "${OPENROUTER_RECOVERY_API}", got "${model.api}"`,
+      );
+    }
+    const native = { ...model, api: "openai-completions" } as unknown as Model<"openai-completions">;
+    return completionsStreamSimple()(native, context, options);
+  }
   if (model.api !== "openai-completions") {
     throw new Error(`OpenRouter recovery wrapper expects api "openai-completions", got "${model.api}"`);
   }
-  return openAICompletionsApi().streamSimple(model as Model<"openai-completions">, context, options);
+  return completionsStreamSimple()(model, context, options);
 }
 
 function syncThrowErrorEvent(
@@ -75,9 +102,52 @@ function syncThrowErrorEvent(
 
 export const APP_TITLE = "openrouter-advanced-provider";
 
-export function buildStandaloneProviderConfig(models: unknown[] | undefined) {
+export function buildStandaloneProviderConfig(
+  models: unknown[] | undefined,
+  opts?: {
+    apiKey?: string;
+    fetchDynamicModels?: (apiKey: string | undefined) => Promise<unknown[]>;
+  },
+) {
+  // Under omp, the registration carries an explicit baseUrl so dynamic model
+  // rows resolve against OpenRouter. Under pi, baseUrl/apiKey are
+  // intentionally left undefined: pi merges registrations key by key and
+  // keeps the builtin defaults when the keys are absent.
+  const ompKeys = isOmp()
+    ? { baseUrl: OPENROUTER_BASE_URL }
+    : {};
+  if (isOmp()) {
+    // Dynamic registration under omp: no static `models` list and NO
+    // `apiKey`. Omp's validateProviderConfiguration only requires
+    // baseUrl/apiKey when static models are present; the dynamic-models
+    // fetcher receives the HOST-RESOLVED key on every call, so the key
+    // cascade (and /logout / key rotation) stays authoritative instead of a
+    // pinned config key shadowing it.
+    //
+    // The fetcher's rows must be remapped: omp builds model rows with a
+    // modelDef-first `api` preference, so any row carrying an explicit api
+    // (e.g. "openrouter") would bypass this wrapper's dispatcher entirely.
+    const wrappedFetch = opts?.fetchDynamicModels
+      ? (key: string | undefined) =>
+          opts.fetchDynamicModels!(key).then((rows) =>
+            rows.map((row) => ({ ...(row as Record<string, unknown>), api: OPENROUTER_RECOVERY_API })),
+          )
+      : undefined;
+    return {
+      ...ompKeys,
+      api: OPENROUTER_RECOVERY_API,
+      streamSimple: streamOpenRouterWithRecovery,
+      headers: {
+        // No HTTP-Referer: this extension sends no public site URL.
+        // X-Title identifies the app in OpenRouter's stats.
+        "X-Title": APP_TITLE,
+      },
+      fetchDynamicModels: wrappedFetch,
+    };
+  }
   return {
     models: models ?? [],
+    // Under pi registration is per-provider with the built-in id.
     api: "openai-completions",
     streamSimple: streamOpenRouterWithRecovery,
     headers: {
@@ -94,6 +164,12 @@ export function streamOpenRouterWithRecovery(
   options?: SimpleStreamOptions,
   delegate: StreamSimpleDelegate = defaultDelegate,
 ): AssistantMessageEventStream {
+  // No provider guard: foreign openai-completions providers cannot reach this
+  // wrapper — under omp the provider is registered with the unique recovery
+  // api id, under pi registration is per-provider. An injected delegate
+  // (argument !== defaultDelegate) is used verbatim, as before.
+  const isInjected = delegate !== defaultDelegate;
+
   const stream = createAssistantMessageEventStream();
 
   void (async () => {
@@ -112,8 +188,11 @@ export function streamOpenRouterWithRecovery(
       });
 
       const outcome = await driveRecoveryLoop(
-        (spec) =>
-          delegate(model, { ...context, messages: spec.messages } as TranscriptContext, spec.options),
+        isInjected
+          ? (spec) =>
+              delegate(model, { ...context, messages: spec.messages } as TranscriptContext, spec.options)
+          : (spec) =>
+              defaultDelegate(model, { ...context, messages: spec.messages } as TranscriptContext, spec.options),
         applyRetry,
         initial,
         state,

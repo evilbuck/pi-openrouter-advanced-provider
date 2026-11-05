@@ -1,9 +1,10 @@
 # pi-openrouter-advanced-provider
 
 An [OpenRouter](https://openrouter.ai) provider extension for the
-[pi coding agent](https://github.com/earendil-works/pi): account-scoped live
-model catalog, per-model provider routing config, just-in-time provider
-selection, and real context windows.
+[pi coding agent](https://github.com/earendil-works/pi) and its
+[omp](https://omp.sh) fork: account-scoped live model catalog, per-model
+provider routing config, just-in-time provider selection, and real context
+windows. One codebase, both hosts.
 
 ## What it does
 
@@ -24,7 +25,8 @@ selection, and real context windows.
   router response stream and puts it on the completed assistant message,
   so pi's session total uses the actual charge instead of zero. If the
   stream does not report a cost, it leaves the message unchanged rather
-  than guessing from another model's list price.
+  than guessing from another model's list price. (omp already applies the
+  billed cost natively, so this capture path runs only under pi.)
 - **Clean info channel.** Extension info messages (`/openrouter-status`,
   `/openrouter-balance`) are kept out of the LLM context, so account and
   status text never pollutes prompts.
@@ -40,12 +42,14 @@ selection, and real context windows.
 
 One of:
 
-- `OPENROUTER_API_KEY` set in the environment launching pi, or
-- an OpenRouter key stored via `/login` in `~/.pi/agent/auth.json`.
+- `OPENROUTER_API_KEY` set in the environment launching the agent, or
+- an OpenRouter key stored via `/login` in the host's auth store.
 
 The extension resolves the key at load time (env first, then the auth
-store). Without a key no registration happens — falling back to the public
-catalog would silently swap account-scoped data for the generic list.
+store). Under pi that is `~/.pi/agent/auth.json`; under omp it also peeks
+read-only at omp's credential store (`~/.omp/agent/agent.db`). Without a key
+no registration happens — falling back to the public catalog would silently
+swap account-scoped data for the generic list.
 
 ## Just-in-time provider selection
 
@@ -103,8 +107,9 @@ One file name, two locations — the location differentiates, nothing else:
 
 - `pi/openrouter-advanced-provider.json` — shipped defaults for the selection
   tuning below.
-- `~/.pi/agent/openrouter-advanced-provider.json` — user overrides, merged
-  per-field on top. Reload via `/openrouter-sync` after editing.
+- `~/.pi/agent/openrouter-advanced-provider.json` (pi) or
+  `~/.omp/agent/openrouter-advanced-provider.json` (omp) — user overrides,
+  merged per-field on top. Reload via `/openrouter-sync` after editing.
 
 ### Selection tuning
 
@@ -215,7 +220,8 @@ preserved.
 ## Install
 
 ```
-pi install npm:pi-openrouter-advanced-provider
+pi install npm:pi-openrouter-advanced-provider     # pi
+omp install npm:pi-openrouter-advanced-provider    # omp
 ```
 
 Or from git:
@@ -224,7 +230,7 @@ Or from git:
 pi install git:github.com/mitchellnemitz/pi-openrouter-advanced-provider
 ```
 
-Then reload pi.
+Then reload the agent.
 
 ## Commands
 
