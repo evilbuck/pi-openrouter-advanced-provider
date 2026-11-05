@@ -7,7 +7,7 @@ Notable changes to pi-openrouter-advanced-provider.
 ### omp compatibility
 
 The extension now runs on both hosts from one codebase: the pi coding agent
-(1.5.0, `@earendil-works/*`) and omp (18.x, `oh-my-pi`),
+(1.5.0, `@earendil-works/*`) and omp (18.16.0, `oh-my-pi`),
 a fork with a legacy-compat loader but divergent credential storage,
 registration validation, and transport dispatch.
 
