@@ -9,6 +9,7 @@ import { fetchCatalogModels, fetchModelEndpoints, getCachedModels } from "./api.
 import { isVariantModelId } from "./config.js";
 import { beginDiscoveryAttempt as beginAttempt, type DiscoveryAttempt } from "./discovery.js";
 import type { OpenRouterModel } from "./types.js";
+import { clearEndpointLimits, setEndpointLimits } from "./selection-limits-state.js";
 
 // ---------------------------------------------------------------------------
 // Snapshot
@@ -186,10 +187,12 @@ export function getStaleSelection(modelId: string): { result: SelectionResult; t
 
 export function setSelection(modelId: string, result: SelectionResult): void {
   selections.set(modelId, { result, timestamp: Date.now() });
+  setEndpointLimits(modelId, result);
 }
 
 export function clearSelections(): void {
   selections.clear();
+  clearEndpointLimits();
 }
 
 export function getCachedModelList(): OpenRouterModel[] | null {

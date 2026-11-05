@@ -54,10 +54,21 @@ What was done:
   remapping the sources' `.js`→`.ts` specifiers — no Bun required. Because
   the lockfile is tracked, CI installs with `npm ci` and npm caching.
 
-Known limitation under omp: the just-in-time selection still pins routing
-per request, but the prewarm clamp of the registered context window to the
-picked provider is pi-only — omp's registered window stays the
-endpoint-derived catalog value.
+- **Selected endpoint limits on both hosts**: JIT prewarming lowers the
+  registered `contextWindow` and `maxTokens` to the selected endpoint's
+  advertised ceilings. Under omp, the extension refreshes its dynamic model
+  rows through the host registry using the host-resolved credential; it does
+  not pin credentials. The outgoing output budget is capped to the lower of
+  selected endpoint and registered model output ceilings in the field
+  selected by the transport. A pre-dispatch pi-ai token estimate checks the
+  transcript and separate system prompt; the final payload hook checks the
+  actual outgoing messages and tool schemas, plus protocol headroom, after
+  any selection refresh. The final payload is measured in its serialized
+  OpenAI wire shape (plain role strings, string-or-part content, `tool_calls`)
+  rather than cast to pi message blocks. The guard reads both `max_tokens` and
+  `max_completion_tokens` and enforces the selected output ceiling. Requests
+  exceeding either endpoint context or completion ceilings are rejected.
+  Estimates can conservatively reject prompts that would otherwise fit.
 
 ### Container test harness and CI
 

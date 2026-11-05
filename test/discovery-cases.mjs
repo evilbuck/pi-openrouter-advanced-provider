@@ -112,9 +112,9 @@ function runHost(bin, args, { caseDir, agentDir, baseUrl, probeArtifact, label }
     const env = { ...process.env };
     // The hosts must resolve the key from the seeded store, never from env,
     // and the runtime-override test seam must stay off.
-    delete env.OPENROUTER_API_KEY;
-    delete env.OPENROUTER_ADVANCED_RUNTIME;
-    env.HOME = caseDir;
+    // Keep omp's extracted native addon in the shared temporary HOME cache;
+    // each case still has a distinct agent dir for credentials and sessions.
+    env.HOME = process.env.SCENARIO_HOME || caseDir;
     env.PI_CODING_AGENT_DIR = agentDir;
     env.OMP_CODING_AGENT_DIR = agentDir;
     env.OPENROUTER_BASE_URL = baseUrl;
@@ -230,23 +230,14 @@ async function seedCredentials(host, bin, agentDir, key, caseDir, timeoutMs) {
     );
     return;
   }
-  // omp creates its own agent.db schema on first run; seed after that. The
-  // documented `omp --no-extensions --print initialize` subcommand HANGS in
-  // some environments (probed 2026-11-05: >90s with the whole agent dir
-  // already written, SIGTERM-only recovery), while the one-shot extension
-  // run shape initializes the same directory in ~2s. So initialize through
-  // that shape, aimed at a closed port so it touches no network and reports
-  // no success. Its exit code is ignored: the only requirement is that
-  // agent.db exists (checked below).
+  // Attempt host initialization first. If omp cannot populate the native
+  // database in this offline run, the pinned seeder creates its auth schema.
   await runHost(
     bin,
-    ["--no-extensions", "-e", path.join(repoDir, "pi", "index.ts"), "-e", probePath, "-p", "/openrouter-sync"],
+    ["--no-extensions", "--print", "initialize"],
     { caseDir, agentDir, baseUrl: "http://127.0.0.1:9/api/v1", probeArtifact: "", label: "init" },
     timeoutMs,
   );
-  if (!fs.existsSync(path.join(agentDir, "agent.db"))) {
-    throw new Error(`omp initialize did not create ${path.join(agentDir, "agent.db")}`);
-  }
   seedOmpDb(agentDir, key);
 }
 

@@ -11,12 +11,12 @@
  *   SCENARIO_HOSTS         comma-separated subset of "pi,omp"
  *   SCENARIO_REPO_DIR      repo root in the container (pi/, test/, scripts/)
  *   SCENARIO_FIXTURE_KEY   the fixture bearer key (sk-or-test-container)
- *   SCENARIO_HOME          writable isolated HOME (tmpfs)
+ *   SCENARIO_HOME          writable temporary HOME/native cache (tmpfs)
  *   SCENARIO_ARTIFACTS_DIR writable dir inside SCENARIO_HOME for artifacts
  *
  * pi/omp binaries are on PATH. For each requested host this script:
  *
- *   1. keyed case — isolated temp home + agent dir, seeded credential store
+ *   1. keyed case — isolated agent dir in the shared temporary HOME, seeded credential store
  *      (pi: agent/auth.json; omp: scripts/seed-omp-db.mjs), two one-shot
  *      turns through the host binary:
  *        a. the fixture glm model  -> catalog key resolution, wrapper
@@ -193,7 +193,7 @@ function hostEnv({ caseDir, agentDir, probeArtifact, label, baseUrl }) {
   // and the runtime-override test seam must stay off.
   delete env.OPENROUTER_API_KEY;
   delete env.OPENROUTER_ADVANCED_RUNTIME;
-  env.HOME = caseDir;
+  env.HOME = scenarioHome;
   env.PI_CODING_AGENT_DIR = agentDir; // honored by both hosts
   env.OMP_CODING_AGENT_DIR = agentDir;
   env.OPENROUTER_BASE_URL = baseUrl; // aims catalog, frontend stats, and completions at the mock
@@ -250,36 +250,67 @@ function runHost(bin, args, env, cwd, timeoutMs = SPAWN_TIMEOUT_MS) {
  * exceed 1 — two leases at once would mean the recovery wrapper's nested
  * dispatch took a second permit, i.e. a silent limit bypass.
  *
+ * The lease root is keyed by omp's CONFIG root (~/.omp, i.e. $HOME/.omp), not
+ * by the per-case agent dir: the harness gives every case its own agent dir
+ * (PI_CODING_AGENT_DIR) but shares one HOME, so the leases land under the
+ * SHARED home. Sampling the per-case dir would observe nothing and let
+ * `maxConcurrent <= 1` pass vacuously.
+ *
  * Real-interval polling is required here (no deterministic substitute): the
  * observed state is live omp processes creating/removing lease directories on
  * the real filesystem.
  */
-function startLeaseSampler(caseDir, intervalMs = 25) {
-  // omp's permit root prefers XDG_STATE_HOME and falls back to the config root
+function startLeaseSampler(homeRoot, intervalMs = 5) {
+  // omp's state root prefers XDG_STATE_HOME and falls back to the config root
   // (~/.omp); sample every root that exists so the sampler stays correct
-  // whichever layout the container resolves.
+  // whichever layout the container resolves. Roots are de-duplicated by real
+  // path so one lease directory is never counted twice.
   const stateRoot = process.env.XDG_STATE_HOME;
-  const segmentDirs = [
-    path.join(caseDir, ".omp", "run", "provider-inflight", OPENROUTER_PROVIDER_SEGMENT),
-    ...(stateRoot ? [path.join(stateRoot, "omp", "run", "provider-inflight", OPENROUTER_PROVIDER_SEGMENT)] : []),
+  const configDir = process.env.PI_CONFIG_DIR;
+  const candidateRoots = [
+    path.join(homeRoot, ".omp"),
+    ...(stateRoot ? [path.join(stateRoot, "omp")] : []),
+    // omp composes its config root as join(homedir(), PI_CONFIG_DIR ?? ".omp"),
+    // so a custom PI_CONFIG_DIR is resolved relative to HOME the same way.
+    ...(configDir ? [path.join(homeRoot, configDir)] : []),
   ];
+  const segmentDirs = [];
+  const seenRoots = new Set();
+  for (const root of candidateRoots) {
+    let key;
+    try {
+      key = fs.realpathSync(root);
+    } catch {
+      key = path.resolve(root);
+    }
+    if (seenRoots.has(key)) continue;
+    seenRoots.add(key);
+    segmentDirs.push(path.join(root, "run", "provider-inflight", OPENROUTER_PROVIDER_SEGMENT));
+  }
   let maxConcurrent = 0;
   let samples = 0;
+  let observedLease = false;
+  let observedSegment = false;
   const timer = setInterval(() => {
     let count = 0;
     for (const segmentDir of segmentDirs) {
       try {
-        count += fs.readdirSync(segmentDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+        const entries = fs.readdirSync(segmentDir, { withFileTypes: true });
+        observedSegment = true;
+        // One lease DIRECTORY per in-flight request; the files inside it
+        // (info.json, .lock) live under the lease, not beside it.
+        count += entries.filter((e) => e.isDirectory()).length;
       } catch {
         // No segment dir yet (nothing in flight): contributes zero.
       }
     }
     samples += 1;
+    if (count > 0) observedLease = true;
     if (count > maxConcurrent) maxConcurrent = count;
   }, intervalMs);
   return {
     stop: () => clearInterval(timer),
-    result: () => ({ maxConcurrent, samples }),
+    result: () => ({ maxConcurrent, samples, observedLease, observedSegment }),
   };
 }
 
@@ -532,6 +563,14 @@ function assertRegistry(check, host, records) {
     const mine = record.rows.filter((row) => accountIds.includes(row.id));
     return mine.length === accountIds.length && new Set(mine.map((row) => row.api)).size === 1 && mine[0]?.api === OPENROUTER_RECOVERY_API;
   }), "host-registry records missing or incomplete");
+  const selectedRows = registries.flatMap((record) => record.rows).filter((row) => row.id === MODEL_ID);
+  check.check(
+    "omp selected endpoint limits are present in the live model registry",
+    selectedRows.length > 0 &&
+      selectedRows.at(-1)?.contextWindow === 524_288 &&
+      selectedRows.at(-1)?.maxTokens === 512,
+    `selected rows: ${JSON.stringify(selectedRows)}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -544,12 +583,14 @@ async function runTurn({ host, bin, caseDir, agentDir, mode, modelArg, prompt, b
   const probeArtifact = path.join(artifactsDir, `${host}-${mode}${modelArg ? `-${san(modelArg)}` : ""}-probe.ndjson`);
   fs.rmSync(probeArtifact, { force: true });
   const env = hostEnv({ caseDir, agentDir, probeArtifact, label: turnLabel, baseUrl });
+  const promptFile = prompt.length > 100_000 ? path.join(caseDir, `${mode}-prompt.txt`) : undefined;
+  if (promptFile) fs.writeFileSync(promptFile, prompt);
   const args = [
     "--no-extensions",
     "-e", path.join(repoDir, "pi/index.ts"),
     "-e", probePath,
     ...(modelArg ? ["--model", modelArg] : []),
-    "-p", prompt,
+    "-p", promptFile ? `@${promptFile}` : prompt,
   ];
   const stdoutArtifact = path.join(artifactsDir, `${host}-${mode}${modelArg ? `-${san(modelArg)}` : ""}.out`);
   const stderrArtifact = stdoutArtifact.replace(/\.out$/, ".err");
@@ -633,6 +674,12 @@ async function runKeyedCase(host, bin, baseUrl, logPath) {
         `x-title=${JSON.stringify(post.title)} expected ${JSON.stringify(APP_TITLE)}`,
       );
       check.check("fixture key used on completion", post.authorization === fixtureKey, `authorization=${JSON.stringify(post.authorization)}`);
+      const outputBudget = post.body?.max_completion_tokens ?? post.body?.max_tokens;
+      check.check(
+        "fixture-model completion stayed within selected endpoint output limit",
+        typeof outputBudget === "number" && outputBudget <= 512,
+        `wire output budget=${JSON.stringify(outputBudget)} expected <= 512`,
+      );
     }
 
     // Real just-in-time verification: the frontend reads must have succeeded
@@ -714,6 +761,41 @@ async function runKeyedCase(host, bin, baseUrl, logPath) {
     assertRegistry(check, host, turn1.probeRecords);
   }
 
+  return check;
+}
+
+async function runLimitBoundaryCase(host, bin, baseUrl, logPath) {
+  const check = new Checks(`${host}/limit-boundary`);
+  const { caseDir, agentDir } = makeCaseHome(host, "limit-boundary");
+  await seedCredentials(host, agentDir, fixtureKey);
+  const turn = await runTurn({
+    host,
+    bin,
+    caseDir,
+    agentDir,
+    mode: "limit-boundary",
+    modelArg: `openrouter/${MODEL_ID}`,
+    prompt: "boundary-token ".repeat(200_000),
+    baseUrl,
+    logPath,
+  });
+  const rejectedBySelectedEndpoint = assistantMessages(turn.probeRecords).some(
+    (message) =>
+      message.stopReason === "error" &&
+      typeof message.errorMessage === "string" &&
+      message.errorMessage.includes("Request exceeds the selected OpenRouter endpoint context limit (524288 tokens)"),
+  );
+  check.check(
+    "boundary input was rejected by the selected 524288-token endpoint context guard",
+    rejectedBySelectedEndpoint,
+    `assistant errors: ${JSON.stringify(assistantMessages(turn.probeRecords).map((message) => message.errorMessage))}`,
+  );
+  const completions = turn.logSlice.filter((row) => isCompletion(row) && row.body?.model === MODEL_ID);
+  check.check(
+    "catalog-sized input above the selected endpoint context was not sent",
+    completions.length === 0,
+    `exit=${turn.result.code} timedOut=${turn.result.timedOut} completion POSTs=${completionSummary(completions)}`,
+  );
   return check;
 }
 
@@ -855,18 +937,53 @@ async function runLimitOneCase(host, bin, baseUrl, logPath) {
   }
 
   // --- Enforcement: two concurrent omp processes, one shared lease root ---
-  const agentB = path.join(caseDir, "agent-b");
-  fs.mkdirSync(agentB, { recursive: true });
-  await seedCredentials(host, agentB, fixtureKey);
-  const sampler = startLeaseSampler(caseDir);
-  const [concurrentA, concurrentB] = await Promise.all([
-    runTurn({ host, bin, caseDir, agentDir, mode: "limit-one-concurrent-a", modelArg, prompt: PROMPT, baseUrl, logPath }),
-    runTurn({ host, bin, caseDir, agentDir: agentB, mode: "limit-one-concurrent-b", modelArg, prompt: PROMPT, baseUrl, logPath }),
-  ]);
-  sampler.stop();
+  // The concurrency check runs against its own mock with a held-open
+  // completion response: the permit is held for the whole in-flight request,
+  // so the lease is observable on disk for the delay window. Without the
+  // delay the request can finish between two samples and the sampler would
+  // never see a lease — the limit check would pass vacuously.
+  const concurrencyLogPath = path.join(artifactsDir, "mock-openrouter-limit-one-concurrent.ndjson");
+  fs.rmSync(concurrencyLogPath, { force: true });
+  const concurrencyMock = await startMockOpenRouter({
+    logPath: concurrencyLogPath,
+    expectedKey: fixtureKey,
+    completionDelayMs: 3_000,
+  });
+  // FRESH agent dirs for both concurrent turns: omp caches the provider
+  // config (including baseUrl) with its dynamic-models catalog, so reusing an
+  // agent dir that already pointed at the primary mock would send these
+  // requests there instead of the concurrency mock (same leak the kill case
+  // isolates). Each agent dir carries the same limit=1 config.
+  const agentConcurrencyA = path.join(caseDir, "agent-concurrency-a");
+  const agentConcurrencyB = path.join(caseDir, "agent-concurrency-b");
+  for (const dir of [agentConcurrencyA, agentConcurrencyB]) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "config.yml"),
+      ["providers:", "  maxInFlightRequests:", "    openrouter: 1", ""].join("\n"),
+    );
+    await seedCredentials(host, dir, fixtureKey);
+  }
+  const sampler = startLeaseSampler(scenarioHome);
+  let concurrentA;
+  let concurrentB;
+  try {
+    [concurrentA, concurrentB] = await Promise.all([
+      runTurn({ host, bin, caseDir, agentDir: agentConcurrencyA, mode: "limit-one-concurrent-a", modelArg, prompt: PROMPT, baseUrl: concurrencyMock.baseUrl, logPath: concurrencyLogPath }),
+      runTurn({ host, bin, caseDir, agentDir: agentConcurrencyB, mode: "limit-one-concurrent-b", modelArg, prompt: PROMPT, baseUrl: concurrencyMock.baseUrl, logPath: concurrencyLogPath }),
+    ]);
+  } finally {
+    sampler.stop();
+    await concurrencyMock.close();
+  }
   const sampling = sampler.result();
   const okA = exitCheck(check, concurrentA, `${host} limit-one concurrent turn A`);
   const okB = exitCheck(check, concurrentB, `${host} limit-one concurrent turn B`);
+  check.check(
+    `${host} limit-one sampler observed the permit store`,
+    sampling.observedLease && sampling.samples > 0,
+    `observed a lease=${sampling.observedLease} segment dir=${sampling.observedSegment} over ${sampling.samples} samples (no lease ever observed = the permit limit was never exercised, so maxConcurrent would pass vacuously)`,
+  );
   check.check(
     `${host} limit-one sampled permits never exceed the limit of one`,
     sampling.maxConcurrent <= 1,
@@ -966,6 +1083,7 @@ async function main() {
       const bin = host;
       hostBin = bin;
       allChecks.push(await runKeyedCase(host, bin, mock.baseUrl, logPath));
+      allChecks.push(await runLimitBoundaryCase(host, bin, mock.baseUrl, logPath));
       allChecks.push(await runStatsDownCase(host, bin, statsDown));
       allChecks.push(await runNoKeyCase(host, bin, mock.baseUrl, logPath));
       // The omp-only permit case: pi's pi-ai has no provider permit, so the

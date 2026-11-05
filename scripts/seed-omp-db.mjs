@@ -93,11 +93,12 @@ export function seedOmpDb(agentDir, apiKey = FIXTURE_KEY) {
   try {
     db.exec("PRAGMA journal_mode = WAL;");
 
-    // Has omp already initialized this db? It owns `settings` and friends.
-    const ompInitialized = db
-      .query("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
-      .get() !== undefined;
-    if (!ompInitialized) {
+    // A prior omp startup can leave a partial db. The auth tables, not the
+    // unrelated settings table, determine whether credential upserts are safe.
+    const hasAuthSchema = Boolean(
+      db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_credentials'").get(),
+    );
+    if (!hasAuthSchema) {
       db.exec(AUTH_SCHEMA_DDL);
       db.query("INSERT OR REPLACE INTO auth_schema_version (id, version) VALUES (1, ?)").run(AUTH_SCHEMA_VERSION);
       db.query("INSERT OR REPLACE INTO auth_change_revision (id, revision) VALUES (1, 0)").run();
@@ -112,7 +113,7 @@ export function seedOmpDb(agentDir, apiKey = FIXTURE_KEY) {
 
     // The auth_change_revision triggers only fire through omp's own writes;
     // bump the revision directly so cached readers re-check credentials.
-    if (ompInitialized) {
+    if (hasAuthSchema) {
       db.query("UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1").run();
     }
 

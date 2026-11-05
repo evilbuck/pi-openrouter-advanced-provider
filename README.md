@@ -15,9 +15,22 @@ windows. One codebase, both hosts.
   agentic-usable capability set (`tools` + `reasoning`); catalog ids with the
   `:batch` call-method suffix are not registered, while `:free` — a price
   indicator, not a tier — remains selectable.
-- **Real context windows.** A model's registered context window comes from
-  the serving provider's endpoint data, not the catalog maximum, so pi
-  budgets and compacts against what the route actually offers.
+- **Real context windows.** The model's registered context window comes from
+  the serving endpoint's selected context limit, not the catalog maximum.
+  Under both pi and omp, JIT prewarming lowers the model's `contextWindow`
+  and `maxTokens` before dispatch; omp refreshes its dynamic rows using the
+  host-resolved credential without pinning a key. Requests also cap the
+  output budget to the lower of the selected endpoint and registered model
+  ceilings in the field selected by the transport. Before dispatch, a pi-ai
+  token estimate checks the transcript and separate system prompt; the final
+  payload hook checks outgoing messages and tool schemas with protocol
+  headroom after any selection refresh. The final payload is measured in its
+  OpenAI wire shape (role strings, string-or-part content, `tool_calls`),
+  and the output budget is read from both `max_tokens` and
+  `max_completion_tokens`, so either field is enforced against the selected
+  ceiling. Requests are rejected if their output budget exceeds
+  the selected ceiling or input plus output exceeds the endpoint context.
+  Estimates can conservatively reject prompts that would otherwise fit.
 - **Just-in-time provider selection.** See below.
 - **Router cost accounting.** OpenRouter reports `"-1"` pricing for
   `openrouter/auto` and `openrouter/auto-beta` because their price varies
@@ -68,8 +81,8 @@ model is selected:
   `provider: {order: [pick], ignore: [...], allow_fallbacks: true}` — the
   single pick first, and if it becomes unavailable, OpenRouter's own
   fallback balancing takes over (minus ignored providers).
-- The picked provider's `context_length` becomes the model's registered
-  context window.
+  The active model's `contextWindow` and `maxTokens` are lowered to the
+  selected endpoint's advertised limits.
 - If a compliant alternative is serving ≥1.75× the winner's p50 throughput,
   you get an advisory notification at switch time. Advisory only — the pick
   stands.

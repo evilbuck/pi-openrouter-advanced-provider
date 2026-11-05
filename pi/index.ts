@@ -19,7 +19,7 @@ import {
   fetchCredits,
 } from "./api.js";
 import { scoreProviders } from "./scoring.js";
-import { clampedSelectionLimits } from "./limits.js";
+import { clampCatalogModelLimits, clampedSelectionLimits } from "./limits.js";
 import { buildStandaloneProviderConfig, streamOpenRouterWithRecovery } from "./stream.js";
 import { restoreRouterCost, wrapRouterCostFetch } from "./auto-cost.js";
 import { bootstrapApiKey, agentRoot, initHost, isOmp } from "./platform.ts";
@@ -29,7 +29,7 @@ import {
   loadRequestConfig,
   mergeRequestConfig,
 } from "./config.js";
-import type { SelectionTuning } from "./types.js";
+import type { ProviderModelConfig, SelectionTuning } from "./types.js";
 import {
   COST_TIERS,
   COST_TIER_BANDS,
@@ -76,6 +76,291 @@ function emitMessage(pi: ExtensionAPI, text: string) {
     content: text,
     display: true,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Output-budget field selection
+//
+// An OpenAI-compatible request body may carry its output budget in either
+// `max_tokens` (legacy) or `max_completion_tokens` (current). pi's OpenAI
+// Completions transport writes the budget into exactly ONE of them: the
+// field its compat selects — `max_completion_tokens` unless the model pins
+// `maxTokensField: "max_tokens"` (only the providers that reject the
+// current field do that; OpenRouter's own models use the current field).
+//
+// Writing the budget into the field the transport does NOT read creates a
+// COMPETING cap: the body then carries two budgets, and the final guard —
+// which measures the largest budget in the body — reserves the larger one
+// against the endpoint's context window. A request whose host budget was
+// smaller than the endpoint's ceiling was therefore measured as if it had
+// asked for the ceiling, and rejected even though it fits.
+// ---------------------------------------------------------------------------
+
+/** Every field an OpenAI-compatible body may use for its output budget. */
+export const OUTPUT_BUDGET_FIELDS = ["max_tokens", "max_completion_tokens"] as const;
+
+export type OutputBudgetField = (typeof OUTPUT_BUDGET_FIELDS)[number];
+
+/**
+ * The field the transport writes by default: `max_completion_tokens`.
+ */
+export const DEFAULT_OUTPUT_BUDGET_FIELD: OutputBudgetField = "max_completion_tokens";
+
+/**
+ * The numeric budget a field carries, or undefined when the field is
+ * absent or unreadable. A numeric string is a budget (it reaches the wire
+ * as one), so it is read as a number; anything else is not a budget that can
+ * be compared against a ceiling.
+ */
+function numericBudget(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+/** Does the body carry a readable budget in this field? */
+function hasBudget(payload: Record<string, unknown>, field: OutputBudgetField): boolean {
+  const value = payload[field];
+  if (value === undefined || value === null) return false;
+  return numericBudget(value) !== undefined;
+}
+
+/**
+ * The output-budget field the transport writes for a model.
+ *
+ * The model's own compat is authoritative — it is what the transport reads.
+ * Without a compat pin, the payload itself is the evidence: the transport
+ * already built it and wrote its budget into exactly one field.
+ */
+export function resolveOutputBudgetField(
+  compat: unknown,
+  payload: Record<string, unknown>,
+): OutputBudgetField {
+  if (compat && typeof compat === "object" && "maxTokensField" in compat) {
+    const pinned = compat.maxTokensField;
+    if (pinned === "max_tokens" || pinned === "max_completion_tokens") return pinned;
+  }
+  const legacy = hasBudget(payload, "max_tokens");
+  const current = hasBudget(payload, "max_completion_tokens");
+  if (legacy && !current) return "max_tokens";
+  if (current && !legacy) return "max_completion_tokens";
+  return DEFAULT_OUTPUT_BUDGET_FIELD;
+}
+
+/**
+ * Clamp the body's output budget to `ceiling`, in the field the transport
+ * actually writes.
+ *
+ * - A budget ABOVE the ceiling is lowered to it (the endpoint cannot serve
+ *   more than its own completion limit).
+ * - A budget at or below the ceiling is PRESERVED: a caller that asked for
+ *   less than the endpoint allows keeps its smaller request, and the guard
+ *   measures that smaller allowance.
+ * - An UNREADABLE budget in the transport's own field is replaced by the
+ *   ceiling: such a budget cannot be honored, and the ceiling is the known
+ *   safe bound. A budget in another field is left alone — the final guard
+ *   fails closed on it with a precise error.
+ * - The transport's own field is set to the ceiling when the body carries
+ *   no budget at all, so an unbounded request stays bounded.
+ * - No other field is ever added: a body that carries the legacy field keeps
+ *   exactly that field, so the transport never sees two competing budgets.
+ *
+ * Returns the new body, or undefined when nothing had to change.
+ */
+export function clampOutputBudget(
+  payload: Record<string, unknown>,
+  ceiling: number,
+  transportField: OutputBudgetField = DEFAULT_OUTPUT_BUDGET_FIELD,
+): Record<string, unknown> | undefined {
+  if (!Number.isFinite(ceiling) || ceiling <= 0) return undefined;
+
+  let changed = false;
+  const next: Record<string, unknown> = { ...payload };
+
+  for (const field of OUTPUT_BUDGET_FIELDS) {
+    const numeric = numericBudget(next[field]);
+    if (numeric === undefined) continue;
+    if (numeric > ceiling) {
+      next[field] = ceiling;
+      changed = true;
+    }
+  }
+
+  const transportValue = next[transportField];
+  if (transportValue === undefined || transportValue === null) {
+    // The transport reads THIS field; without it the request carries no
+    // budget at all. Bound it by the endpoint's ceiling.
+    next[transportField] = ceiling;
+    changed = true;
+  } else if (numericBudget(transportValue) === undefined) {
+    // Unreadable budget in the transport's own field: replace it with the
+    // known-safe bound rather than let it reach the wire.
+    next[transportField] = ceiling;
+    changed = true;
+  }
+
+  return changed ? next : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Per-request routing transform
+//
+// The `before_provider_request` hook fires for EVERY provider's requests, so
+// the transform first decides whether the request is ours, then layers the
+// routing configuration, the just-in-time provider pick, the output-budget
+// clamp and the session cost tier onto the payload.
+//
+// The transform lives here as a standalone function (with the extension's
+// live state injected) so the routing hook AND the final guard can be
+// exercised together in a test.
+// ---------------------------------------------------------------------------
+
+/** A cached selection, as pi/state.ts stores it. */
+export interface CachedSelection {
+  result: SelectionResult;
+  timestamp: number;
+}
+
+/** Everything the routing transform needs from the extension's live state. */
+export interface RequestRoutingDeps {
+  /** Per-request config layers (workspace defaults + per-model entries). */
+  requestConfig: RequestConfig;
+  /** Selection tuning (disabled selection short-circuits the JIT pick). */
+  selectionTuning: SelectionTuning;
+  /** The registered catalog rows (the extension's snapshot). */
+  catalogModels: () => ProviderModelConfig[];
+  /**
+   * The catalog `maxTokens` registered for a model BEFORE the selected
+   * endpoint narrowed it — the ceiling a request may never exceed.
+   */
+  baseMaxTokens: (modelId: string) => number | undefined;
+  /** The fresh (non-stale) selection for a model, if any. */
+  getSelection: (modelId: string) => CachedSelection | undefined;
+  /** The last-known selection for a model, even past its TTL. */
+  getStaleSelection: (modelId: string) => CachedSelection | undefined;
+  /** The just-in-time provider pick (network-backed, may be undefined). */
+  selectProvider: (
+    modelId: string,
+    apiKey: string | undefined,
+    force: boolean,
+  ) => Promise<SelectionResult | undefined>;
+  /** The session's cost tier, or null for the workspace default. */
+  tier: () => CostTier | null;
+}
+
+/**
+ * The `before_provider_request` payload transform.
+ *
+ * Returns the replacement payload, or undefined when the request is not ours
+ * (the host then keeps the original payload).
+ */
+export async function routeRequestPayload(
+  payload: unknown,
+  deps: RequestRoutingDeps,
+): Promise<unknown> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const model = (payload as Record<string, unknown>).model;
+  if (typeof model !== "string") return undefined;
+
+  // The event fires for every provider's requests and carries no provider
+  // field. OpenRouter settings must only touch OpenRouter requests: gate on
+  // the model being one this extension knows — in the registered catalog,
+  // carrying a config entry, or holding a cached selection — or being
+  // OpenRouter-shaped (author/slug with optional :variant), so
+  // workspace-wide routing defaults still reach models the catalog sync
+  // has not seen yet. Other providers' wire model ids are neither.
+  const openrouterShaped = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/i.test(model);
+  const catalog = deps.catalogModels();
+  const inCatalog = catalog.some((entry) => entry.id === model);
+  if (
+    !inCatalog &&
+    !openrouterShaped &&
+    !deps.requestConfig.models?.has(model) &&
+    !deps.getStaleSelection(model)
+  )
+    return undefined;
+
+  // Defaults (requests.defaults) apply to every request; the per-model
+  // entry and the JIT pick then layer on top — their provider objects
+  // merge over the defaults', so e.g. defaults' data_collection survives
+  // alongside a selection's order. The session cost tier is applied last,
+  // so an explicit /openrouter-tier selection replaces any auto-router
+  // plugin entry the static config layers put on the payload.
+  let base: Record<string, unknown> = payload as Record<string, unknown>;
+  if (deps.requestConfig.defaults) {
+    base = mergeRequestConfig(payload, deps.requestConfig.defaults) as Record<string, unknown>;
+  }
+
+  let result: Record<string, unknown> | undefined;
+  const override = deps.requestConfig.models?.get(model);
+  // With selection disabled the JIT pick is skipped entirely — the config
+  // layers above still apply, and OpenRouter's default routing serves.
+  const selected =
+    deps.selectionTuning.enabled && !deps.getSelection(model)
+      ? await deps.selectProvider(model, undefined, false)
+      : undefined;
+  const selection = selected
+    ? { result: selected }
+    : deps.selectionTuning.enabled
+      ? (deps.getSelection(model) ?? deps.getStaleSelection(model))
+      : undefined;
+  if (override) {
+    result = mergeRequestConfig(base, override) as Record<string, unknown>;
+  } else {
+    const pick = selection?.result.pick;
+    if (pick) {
+      const ignore = selection.result.ignore;
+      const provider: Record<string, unknown> = {
+        order: [pick],
+        allow_fallbacks: true,
+      };
+      // No provider.quantizations pin: it is a request-wide filter, and when
+      // no endpoint matches it the request hard-fails ("No endpoints found
+      // for the request with quantization: ...") even with allow_fallbacks —
+      // a stale score would break every request. A fallback serving a
+      // different quantization than the scored row is a soft mismatch; the
+      // registered context window may overestimate until the next selection
+      // refresh. Merge the computed stunted-provider list with any ignore
+      // list the defaults or a prior layer already set, instead of replacing
+      // it.
+      const baseIgnore = Array.isArray((base.provider as Record<string, unknown> | undefined)?.ignore)
+        ? ((base.provider as Record<string, unknown>).ignore as unknown[])
+        : [];
+      const mergedIgnore = [...new Set([...baseIgnore, ...ignore])];
+      if (mergedIgnore.length > 0) provider.ignore = mergedIgnore;
+      result = { ...base, provider: { ...(base.provider as Record<string, unknown> ?? {}), ...provider } };
+    } else {
+      // No selection: leave the payload as the config layers left it.
+      result = base === payload ? undefined : base;
+    }
+  }
+
+  const endpointMaxTokens = selection?.result.maxCompletionTokens;
+  if (!override && endpointMaxTokens && endpointMaxTokens > 0) {
+    const outgoing = result ?? base;
+    const catalogMaxTokens =
+      deps.baseMaxTokens(model) ?? catalog.find((entry) => entry.id === model)?.maxTokens;
+    const outputCeiling =
+      catalogMaxTokens && catalogMaxTokens > 0
+        ? Math.min(endpointMaxTokens, catalogMaxTokens)
+        : endpointMaxTokens;
+    // Clamp the budget in the field the transport actually writes. Writing
+    // the OTHER field would add a second, competing budget the transport
+    // ignores — and the final guard, which measures the largest budget in
+    // the body, would then reserve that larger allowance against the
+    // endpoint's context window and reject a request that fits.
+    const transportField = resolveOutputBudgetField(
+      catalog.find((entry) => entry.id === model)?.compat,
+      outgoing,
+    );
+    const clamped = clampOutputBudget(outgoing, outputCeiling, transportField);
+    if (clamped) result = clamped;
+  }
+
+  return withSessionTier(result, payload, model, deps.tier());
 }
 
 export default async function openrouterModelsExtension(pi: ExtensionAPI) {
@@ -193,37 +478,94 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   // mutates them — a later refresh without a limit must restore the base, not
   // keep the previous selection's stale cap.
   const baseRegistration = new Map<string, { contextWindow: number; maxTokens: number }>();
+  // Omp's dynamic registry rows are refreshed after selection so the active
+  // model budget follows the chosen endpoint without registering a static key.
+  const ompSelectionLimits = new Map<string, SelectionResult>();
+  const ompAppliedSelectionLimits = new Map<string, { contextWindow: number; maxTokens: number }>();
+  let ompLimitCredentialFingerprint: string | undefined;
+
+  function applyOmpSelectionLimits(models: ProviderRegistration["models"], apiKey: string | undefined) {
+    const fingerprint = keyFingerprint(apiKey);
+    if (fingerprint !== ompLimitCredentialFingerprint) {
+      ompSelectionLimits.clear();
+      ompAppliedSelectionLimits.clear();
+      ompLimitCredentialFingerprint = fingerprint;
+    }
+    if (!isOmp() || !models) return models;
+    for (const model of models) {
+      if (!selectionTuning.enabled || requestConfig.models?.has(model.id)) {
+        ompSelectionLimits.delete(model.id);
+      }
+    }
+    ompAppliedSelectionLimits.clear();
+    if (ompSelectionLimits.size === 0) return models;
+    const clamped = clampCatalogModelLimits(models, ompSelectionLimits);
+    for (const model of clamped) {
+      if (ompSelectionLimits.has(model.id)) {
+        ompAppliedSelectionLimits.set(model.id, {
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxTokens,
+        });
+      }
+    }
+    return clamped;
+  }
+
+  type ModelLimitRefreshContext = {
+    modelRegistry: { refreshProvider(provider: string): Promise<void> };
+  };
+
+  async function refreshOmpModelLimits(
+    ctx: ModelLimitRefreshContext,
+    modelId: string,
+    apiKey: string | undefined,
+    result: SelectionResult,
+  ) {
+    const fingerprint = keyFingerprint(apiKey);
+    if (fingerprint !== ompLimitCredentialFingerprint) {
+      ompSelectionLimits.clear();
+      ompAppliedSelectionLimits.clear();
+      ompLimitCredentialFingerprint = fingerprint;
+    }
+    ompSelectionLimits.set(modelId, result);
+    await ctx.modelRegistry.refreshProvider(PROVIDER_NAME);
+    // refreshProvider re-runs dynamic discovery, which clears the selection
+    // cache. Keep this prompt's scored choice stable for the request hook.
+    setSelection(modelId, result);
+  }
 
   /** Pre-warm: score the model now and adjust its registered context window. */
   async function prewarm(modelId: string, apiKey: string | undefined, ctx: any, force = false): Promise<void> {
     const result = await selectProvider(modelId, apiKey, force);
     if (!result) return;
 
-    // Adjust the model's registered context window to the picked provider's,
-    // so budgeting/autocompact reflect the provider that will actually serve.
-    const models = getSnapshot().models.slice();
-    if (models.length === 0) return;
-    const entry = models.find((m) => m.id === modelId);
-    if (!entry) return;
-    if (!baseRegistration.has(modelId)) {
-      baseRegistration.set(modelId, { contextWindow: entry.contextWindow, maxTokens: entry.maxTokens });
-    }
-    const base = baseRegistration.get(modelId)!;
-    // Advertised endpoint limits are upper bounds to trust only downward:
-    // providers list completion limits their upstreams do not honor, and a
-    // raised cap makes pi's request budgeting send max_tokens the serving
-    // provider rejects. The registered base is the verified ceiling.
-    const next = clampedSelectionLimits(base, result);
-    if (!isOmp() && (entry.contextWindow !== next.contextWindow || entry.maxTokens !== next.maxTokens)) {
-      entry.contextWindow = next.contextWindow;
-      entry.maxTokens = next.maxTokens;
-      // Full re-registration from the committed snapshot: pi replaces the
-      // model list wholesale, so the snapshot list plus the clamped entry is
-      // the complete new registration. Under omp the registration is dynamic
-      // (fetchDynamicModels) — there is no static list to re-register, and
-      // re-registering would need a pinned key, so the clamp-to-picked-
-      // provider feature is pi-only in this pass.
-      registerStandalone(models, apiKey);
+    if (isOmp()) {
+      const models = getSnapshot().models;
+      const entry = models.find((m) => m.id === modelId);
+      if (!entry) return;
+      const next = clampedSelectionLimits(entry, result);
+      const previous = ompAppliedSelectionLimits.get(modelId);
+      const registered = previous ?? entry;
+      if (registered.contextWindow !== next.contextWindow || registered.maxTokens !== next.maxTokens) {
+        await refreshOmpModelLimits(ctx, modelId, apiKey, result);
+      }
+    } else {
+      // Adjust the model's registered context window to the picked provider's,
+      // so budgeting/autocompact reflect the provider that will actually serve.
+      const models = getSnapshot().models.slice();
+      if (models.length === 0) return;
+      const entry = models.find((m) => m.id === modelId);
+      if (!entry) return;
+      if (!baseRegistration.has(modelId)) {
+        baseRegistration.set(modelId, { contextWindow: entry.contextWindow, maxTokens: entry.maxTokens });
+      }
+      const base = baseRegistration.get(modelId)!;
+      const next = clampedSelectionLimits(base, result);
+      if (entry.contextWindow !== next.contextWindow || entry.maxTokens !== next.maxTokens) {
+        entry.contextWindow = next.contextWindow;
+        entry.maxTokens = next.maxTokens;
+        registerStandalone(models, apiKey);
+      }
     }
 
     if (result.advisory) {
@@ -234,6 +576,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       }
     }
   }
+
 
   // ---------- Session cost tier (auto-router) ----------
 
@@ -263,78 +606,16 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   //      stunted-context providers are ignored so fallbacks cannot land there
   //   4. nothing — the request goes out with OpenRouter's default routing
   pi.on("before_provider_request", async (event) => {
-    const payload = event.payload;
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
-    const model = (payload as Record<string, unknown>).model;
-    if (typeof model !== "string") return;
-
-    // The event fires for every provider's requests and carries no provider
-    // field. OpenRouter settings must only touch OpenRouter requests: gate on
-    // the model being one this extension knows — in the registered catalog,
-    // carrying a config entry, or holding a cached selection — or being
-    // OpenRouter-shaped (author/slug with optional :variant), so
-    // workspace-wide routing defaults still reach models the catalog sync
-    // has not seen yet. Other providers' wire model ids are neither.
-    const openrouterShaped = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/i.test(model);
-    const inCatalog = getSnapshot().models.some((m) => m.id === model);
-    if (
-      !inCatalog &&
-      !openrouterShaped &&
-      !requestConfig.models?.has(model) &&
-      !getStaleSelection(model)
-    )
-      return;
-
-    // Defaults (requests.defaults) apply to every request; the per-model
-    // entry and the JIT pick then layer on top — their provider objects
-    // merge over the defaults', so e.g. defaults' data_collection survives
-    // alongside a selection's order. The session cost tier is applied last,
-    // so an explicit /openrouter-tier selection replaces any auto-router
-    // plugin entry the static config layers put on the payload.
-    let base: Record<string, unknown> = payload as Record<string, unknown>;
-    if (requestConfig.defaults) {
-      base = mergeRequestConfig(payload, requestConfig.defaults) as Record<string, unknown>;
-    }
-
-    let result: Record<string, unknown> | undefined;
-    const override = requestConfig.models?.get(model);
-    // With selection disabled the JIT pick is skipped entirely — the config
-    // layers above still apply, and OpenRouter's default routing serves.
-    const selected = selectionTuning.enabled && !getSelection(model) ? await selectProvider(model, undefined, false) : undefined;
-    const selection = selected ? { result: selected } : selectionTuning.enabled ? (getSelection(model) ?? getStaleSelection(model)) : undefined;
-    if (override) {
-      result = mergeRequestConfig(base, override) as Record<string, unknown>;
-    } else {
-      const pick = selection?.result.pick;
-      if (pick) {
-        const ignore = selection.result.ignore;
-        const provider: Record<string, unknown> = {
-          order: [pick],
-          allow_fallbacks: true,
-        };
-        // No provider.quantizations pin: it is a request-wide filter, and when
-        // no endpoint matches it the request hard-fails ("No endpoints found
-        // for the request with quantization: ...") even with allow_fallbacks —
-        // a stale score would break every request. A fallback serving a
-        // different quantization than the scored row is a soft mismatch; the
-        // registered context window may overestimate until the next selection
-        // refresh. Merge the computed stunted-provider list with any ignore
-        // list the defaults or a prior layer already set, instead of replacing
-        // it.
-        const baseIgnore = Array.isArray((base.provider as Record<string, unknown> | undefined)?.ignore)
-          ? ((base.provider as Record<string, unknown>).ignore as unknown[])
-          : [];
-        const mergedIgnore = [...new Set([...baseIgnore, ...ignore])];
-        if (mergedIgnore.length > 0) provider.ignore = mergedIgnore;
-        result = { ...base, provider: { ...(base.provider as Record<string, unknown> ?? {}), ...provider } };
-      } else {
-        // No selection: leave the payload as the config layers left it.
-        result = base === payload ? undefined : base;
-      }
-    }
-
-    const tier = activeSessionId !== undefined ? (tierBySession.get(activeSessionId) ?? null) : null;
-    return withSessionTier(result, payload, model, tier);
+    return routeRequestPayload(event.payload, {
+      requestConfig,
+      selectionTuning,
+      catalogModels: () => getSnapshot().models,
+      baseMaxTokens: (modelId) => baseRegistration.get(modelId)?.maxTokens,
+      getSelection,
+      getStaleSelection,
+      selectProvider,
+      tier: () => (activeSessionId !== undefined ? (tierBySession.get(activeSessionId) ?? null) : null),
+    });
   });
 
   // ---------- Provider registration (standalone catalog) ----------
@@ -401,6 +682,8 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       // catalog would present generic models as this provider's account
       // rows; an empty set honestly reports "nothing available" and leaves
       // omp's builtin openrouter rows in place.
+      ompSelectionLimits.clear();
+      ompLimitCredentialFingerprint = undefined;
       completeDiscoveryAttempt(attempt, { status: "no-key", modelCount: 0, rows: [] });
       return [];
     }
@@ -410,7 +693,8 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     baseRegistration.clear();
     try {
       const result = await buildPlainSync(apiKey, false, requestConfig);
-      const published = await publishDiscoveryRows(attempt, result.models);
+      const models = applyOmpSelectionLimits(result.models, apiKey) ?? [];
+      const published = await publishDiscoveryRows(attempt, models);
       if (published.status === "superseded") {
         // A newer attempt owns the catalog now: publish ITS rows, not ours.
         completeDiscoveryAttempt(attempt, { status: "superseded", modelCount: published.rows.length, rows: published.rows });
@@ -419,10 +703,10 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       commitSnapshot(generation, result.models);
       completeDiscoveryAttempt(attempt, {
         status: "ok",
-        modelCount: result.models.length,
-        rows: result.models,
+        modelCount: models.length,
+        rows: models,
       });
-      return result.models;
+      return models;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       completeDiscoveryAttempt(attempt, { status: "failed", error: message });
