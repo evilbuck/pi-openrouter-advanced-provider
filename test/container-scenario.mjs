@@ -55,6 +55,7 @@ import {
 } from "./mock-openrouter.mjs";
 import { ACCOUNT_MODELS, PUBLIC_MODELS } from "./fixtures/openrouter.mjs";
 import { seedOmpDb } from "../scripts/seed-omp-db.mjs";
+import { runDiscoveryCases } from "./discovery-cases.mjs";
 
 /**
  * The unique api id the provider extension registers under omp
@@ -970,6 +971,21 @@ async function main() {
       // The omp-only permit case: pi's pi-ai has no provider permit, so the
       // limit-one config and the cross-process lease sampling are omp-only.
       if (host === "omp") allChecks.push(await runLimitOneCase(host, bin, mock.baseUrl, logPath));
+      // Discovery consistency (failed refresh reporting, prior-catalog
+      // retention, overlap, logout): self-contained module with its own
+      // mocks and case homes under SCENARIO_HOME.
+      const discovery = await runDiscoveryCases({
+        host,
+        bin,
+        rootDir: scenarioHome,
+        artifactsDir,
+        timeoutMs: SPAWN_TIMEOUT_MS,
+      });
+      allChecks.push({
+        prefix: `${host}/discovery`,
+        passed: discovery.passed,
+        failures: discovery.failures.map((f) => ({ name: `[${f.case}] ${f.name}`, detail: f.detail })),
+      });
     }
   } finally {
     await mock.close();

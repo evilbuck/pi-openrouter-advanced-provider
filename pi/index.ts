@@ -22,7 +22,7 @@ import { scoreProviders } from "./scoring.js";
 import { clampedSelectionLimits } from "./limits.js";
 import { buildStandaloneProviderConfig, streamOpenRouterWithRecovery } from "./stream.js";
 import { restoreRouterCost, wrapRouterCostFetch } from "./auto-cost.js";
-import { bootstrapApiKey, initHost, isOmp } from "./platform.ts";
+import { bootstrapApiKey, agentRoot, initHost, isOmp } from "./platform.ts";
 import {
   DEFAULT_SELECTION,
   isVariantModelId,
@@ -49,7 +49,23 @@ import {
   setSelection,
   getStaleSelection,
   clearSelections,
+  beginDiscoveryAttempt,
+  completeDiscoveryAttempt,
+  publishDiscoveryRows,
+  getNewerDiscoveryAttempt,
+  getDiscoveryAttemptCount,
+  getDiscoveryOutcomesSince,
+  keyFingerprint,
+  summarizeDiscovery,
+  DiscoveryFailedError,
+  type DiscoveryAttempt,
 } from "./state.js";
+// The last-good store is configured and consumed here (host wiring), so it
+// comes straight from the ledger rather than through state's re-exports.
+import {
+  configureLastGoodPersistence,
+  lastGoodRowsForFailedAttempt,
+} from "./discovery.js";
 
 const APP_TITLE = "openrouter-advanced-provider";
 const OPENROUTER_INFO_MESSAGE_TYPE = "openrouter-info";
@@ -347,34 +363,81 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
    * what syncPlain's body does minus registerProvider: refreshes the request
    * config, clears stale selections, rebuilds the catalog, and commits the
    * snapshot. Omp calls this with the host-resolved key each time, so
-   * rotation/logout flow naturally. Failures PROPAGATE: returning a stale
-   * snapshot would report the previous key's account catalog as a successful
-   * discovery for the new key (and mask ordinary 5xx/timeouts). The host's
-   * discovery machinery owns failure handling — omp keeps its cached rows
-   * and surfaces the error; syncPlain's refreshProvider call reports it.
+   * rotation/logout flow naturally.
+   *
+   * The host consumes the rows this returns as DISCOVERY DATA (omp merges
+   * them into the provider's model set), so the rows this publishes must
+   * always be the current account's catalog. Every invocation is therefore
+   * recorded as a discovery attempt:
+   *
+   *   - On failure the attempt records the error as FAILED. omp's discovery
+   *     machinery does NOT keep the previous catalog usable: omp 18.16
+   *     evicts both the served catalog and its persisted agent/models.db
+   *     cache when a discovery fails, so propagating the error would wipe
+   *     the account's usable catalog. When THIS credential previously
+   *     committed a good catalog — this process's ledger, or the agent-dir
+   *     mirror a previous process wrote — the fetcher therefore SERVES
+   *     those last-known-good rows instead of throwing: the host keeps a
+   *     usable prior catalog, while the attempt's recorded outcome stays
+   *     "failed" so syncPlain still reports the failure from the ledger
+   *     (never a success announcement). A first-ever failure has nothing to
+   *     preserve and propagates the error; a retired account's rows are
+   *     never served — the supersession veto below covers served rows too.
+   *   - On success, when a NEWER attempt has already started, this attempt
+   *     was superseded: a host refresh that overlaps a credential change
+   *     would otherwise hand the host the retired account's rows. The newer
+   *     attempt's rows are published instead (the same rows for every attempt
+   *     of one refresh), so the host registry only ever sees the newest
+   *     catalog. A newer attempt with a DIFFERENT credential that failed
+   *     leaves nothing publishable, so this attempt publishes no rows
+   *     rather than the retired account's.
    */
   async function syncFetcher(
     apiKey: string | undefined,
   ): Promise<NonNullable<ProviderRegistration["models"]>> {
+    const attempt = beginDiscoveryAttempt(keyFingerprint(apiKey));
     if (!apiKey) {
       // Omp invokes the fetcher even unauthenticated. Returning the public
       // catalog would present generic models as this provider's account
       // rows; an empty set honestly reports "nothing available" and leaves
       // omp's builtin openrouter rows in place.
+      completeDiscoveryAttempt(attempt, { status: "no-key", modelCount: 0, rows: [] });
       return [];
     }
     const generation = nextGeneration();
     refreshRequestConfig();
     clearSelections();
     baseRegistration.clear();
-    const result = await buildPlainSync(apiKey ?? undefined, false, requestConfig);
-    if (isStale(generation)) {
-      // A newer sync superseded this one — still return the freshly built
-      // rows (omp needs rows to register), just skip the commit.
+    try {
+      const result = await buildPlainSync(apiKey, false, requestConfig);
+      const published = await publishDiscoveryRows(attempt, result.models);
+      if (published.status === "superseded") {
+        // A newer attempt owns the catalog now: publish ITS rows, not ours.
+        completeDiscoveryAttempt(attempt, { status: "superseded", modelCount: published.rows.length, rows: published.rows });
+        return published.rows;
+      }
+      commitSnapshot(generation, result.models);
+      completeDiscoveryAttempt(attempt, {
+        status: "ok",
+        modelCount: result.models.length,
+        rows: result.models,
+      });
       return result.models;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      completeDiscoveryAttempt(attempt, { status: "failed", error: message });
+      // omp evicts the served catalog (and its persisted cache) when
+      // discovery fails. Serving this credential's last-known-good rows
+      // keeps the host catalog usable across the failure; the FAILED
+      // outcome recorded above is what syncPlain reports, so the failure is
+      // still surfaced — the served rows are never announced as a success.
+      // Nothing to preserve (first-ever failure), or a newer
+      // different-credential attempt retired this account ([]-publishing is
+      // the veto): propagate.
+      const lastGood = lastGoodRowsForFailedAttempt(attempt);
+      if (lastGood) return lastGood;
+      throw err;
     }
-    commitSnapshot(generation, result.models);
-    return result.models;
   }
 
   async function bootstrapPlainSync() {
@@ -384,6 +447,13 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       // fetchDynamicModels instead of a static list, and omp invokes it with
       // the HOST-RESOLVED key during its own startup refresh. No key is
       // pinned here, so /logout and key rotation stay authoritative.
+      //
+      // Mirror the last-known-good catalogs into the agent dir: omp runs are
+      // one-shot processes, and without the mirror a fresh process has
+      // nothing to serve when its first discovery fails, so it would evict
+      // the persisted catalog the previous process left behind (see
+      // syncFetcher). Fingerprints only — raw keys are never stored.
+      configureLastGoodPersistence(path.join(agentRoot(), "openrouter-last-good.json"));
       pi.registerProvider(
         PROVIDER_NAME,
         buildStandaloneProviderConfig(undefined, { fetchDynamicModels: syncFetcher }) as ProviderConfig,
@@ -419,14 +489,27 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   async function syncPlain(ctx: any, silent = false, force = false) {
     if (isOmp()) {
       // Dynamic registration: no re-registration with a pinned key. Ask the
-      // host registry to re-run fetchDynamicModels — strategy "online"
-      // forces a refresh past the 24h dynamic-models cache — then report
-      // counts from the committed snapshot the fetcher updated.
+      // host registry to re-run fetchDynamicModels — strategy "online" forces a
+      // refresh past the 24h dynamic-models cache.
+      //
+      // The host RESOLVES that refresh even when the fetch failed: omp's
+      // model manager catches a discovery error and falls back to its cached
+      // rows, so the promise says nothing about the outcome. Reporting the
+      // snapshot size here would announce the PREVIOUS catalog as a fresh
+      // success (or "0 models synced" on a first-ever failure). The report
+      // therefore comes from the discovery attempts this refresh produced.
       if (!silent) ctx.ui.notify("Fetching OpenRouter models...", "info");
+      const mark = getDiscoveryAttemptCount();
       try {
         await ctx.modelRegistry.refreshProvider(PROVIDER_NAME, "online");
-        const snapshot = getSnapshot();
-        if (!silent) ctx.ui.notify(`OpenRouter: ${snapshot.models.length} models synced`, "info");
+        const report = summarizeDiscovery(getDiscoveryOutcomesSince(mark));
+        if (report.ok) {
+          if (!silent) ctx.ui.notify(`OpenRouter: ${report.modelCount} models synced`, "info");
+        } else if (report.noKey) {
+          if (!silent) ctx.ui.notify("No OpenRouter API key configured — run /login openrouter", "warning");
+        } else {
+          if (!silent) ctx.ui.notify(`OpenRouter sync failed: ${report.error}`, "error");
+        }
         notifyConfigWarnings(ctx);
       } catch (err: any) {
         if (!silent) ctx.ui.notify(`OpenRouter sync failed: ${err?.message}`, "error");
@@ -434,8 +517,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const generation = nextGeneration();
-
+    let attempt: DiscoveryAttempt | undefined;
     try {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
       if (!apiKey) {
@@ -447,23 +529,52 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       }
       if (!silent) ctx.ui.notify("Fetching OpenRouter models...", "info");
 
+      // Pi's registry consumes the rows this sync registers, so the attempt
+      // ledger guards them exactly as it guards omp's discovery data. The
+      // attempt id doubles as the snapshot generation.
+      attempt = beginDiscoveryAttempt(keyFingerprint(apiKey));
+      const generation = attempt.id;
       refreshRequestConfig();
       clearSelections();
       const result = await buildPlainSync(apiKey, force, requestConfig);
 
-      if (isStale(generation)) return;
+      const published = await publishDiscoveryRows(attempt, result.models);
+      if (published.status === "superseded") {
+        // A newer sync owns the catalog; it registers its own rows.
+        completeDiscoveryAttempt(attempt, {
+          status: "superseded",
+          modelCount: published.rows.length,
+          rows: published.rows,
+        });
+        return;
+      }
+      if (isStale(generation)) {
+        completeDiscoveryAttempt(attempt, { status: "superseded", modelCount: 0, rows: [] });
+        return;
+      }
       commitSnapshot(generation, result.models);
       registerStandalone(result.models, apiKey);
       // The registered snapshot changed: stale selections (and their recorded
       // base limits) from the previous catalog must not survive the sync.
       clearSelections();
       baseRegistration.clear();
+      completeDiscoveryAttempt(attempt, {
+        status: "ok",
+        modelCount: result.modelCount,
+        rows: result.models,
+      });
 
       if (!silent) {
         ctx.ui.notify(`OpenRouter: ${result.modelCount} models synced`, "info");
       }
       notifyConfigWarnings(ctx);
     } catch (err: any) {
+      if (attempt) {
+        completeDiscoveryAttempt(attempt, {
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       if (!silent) ctx.ui.notify(`OpenRouter sync failed: ${err?.message}`, "error");
     }
   }
