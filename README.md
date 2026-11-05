@@ -250,3 +250,30 @@ npm test
 The typecheck maps `@earendil-works/pi-ai` the same way pi's extension
 loader resolves it at runtime, so the types you compile against are the
 types that serve.
+
+## Container test harness
+
+`npm run test:container` exercises the extension end-to-end inside a pinned
+dual-host container — no OpenRouter account or key required. The image
+(`oven/bun:1.4.3-debian`) installs pi 1.5.0 and omp 18.16.0 from their
+official releases, checksum-verified at build time. The mock OpenRouter API
+runs **inside** the container and the container runs with `--network=none`,
+so no live API call can happen and your real credentials are never mounted
+or copied in — the harness seeds fixture credential stores (fixture key
+`sk-or-test-container`) into an isolated tmpfs HOME.
+
+```
+npm run test:container                    # both hosts (pi + omp)
+npm run test:container -- --host=pi       # single host (or --host=omp)
+npm run test:container -- --no-cache      # rebuild the image without layer cache
+```
+
+`--live=false` is the only permitted `--live` setting (the harness is
+mock-only); any other value exits with an error. The runner asserts against
+the mock's request log (fixture key used, public catalog never fetched while
+keyed), registry/session artifacts, and process exits; it exits nonzero on
+any failed assertion.
+
+In CI, the same command runs in the `container-matrix` workflow job (one leg
+per host) with the Docker build cache warmed from a saved image — see
+`.github/workflows/ci.yml`. Requires Docker locally.

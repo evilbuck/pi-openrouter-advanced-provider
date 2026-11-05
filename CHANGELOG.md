@@ -53,3 +53,21 @@ Known limitation under omp: the just-in-time selection still pins routing
 per request, but the prewarm clamp of the registered context window to the
 picked provider is pi-only — omp's registered window stays the
 endpoint-derived catalog value.
+
+### Container test harness and CI
+
+- **`npm run test:container`**: a one-command, reproducible harness that
+  builds a pinned dual-host image (`oven/bun:1.4.3-debian` with pi 1.5.0 and
+  omp 18.16.0, checksum-verified from the official release checksums), boots
+  both hosts headlessly against a mock OpenRouter server, and asserts the
+  compatibility behaviors found during the port: host detection, key
+  resolution, account-scoped catalog sync, just-in-time selection, recovery
+  wrapper engagement (via the mock `X-Title` header), cost accounting, and
+  the no-key masquerade guard. Mock only — the container runs with
+  `--network=none`, no credentials are mounted, and `--live=false` is the
+  only permitted mode. Flags: `--host=pi|omp|both`, `--no-cache`.
+- **GitHub Actions** (`.github/workflows/ci.yml`): a `gates` job
+  (typecheck + unit tests) and a `container-matrix` job running the same
+  harness command once per host. No secrets; the Docker build cache is
+  warmed by saving the built image (with inline cache metadata) to the
+  GitHub Actions cache and restoring it on later runs.

@@ -109,11 +109,9 @@ export function buildStandaloneProviderConfig(
     fetchDynamicModels?: (apiKey: string | undefined) => Promise<unknown[]>;
   },
 ) {
-  // Under omp, the registration carries an explicit baseUrl so dynamic model
-  // rows resolve against OpenRouter. Under pi, baseUrl/apiKey are
-  // intentionally left undefined: pi merges registrations key by key and
-  // keeps the builtin defaults when the keys are absent.
-  const ompKeys = isOmp()
+  // Pi keeps builtin defaults unless an endpoint override is configured.
+  // Omp always needs a baseUrl for dynamic model registration.
+  const baseUrlKeys = isOmp() || process.env.OPENROUTER_BASE_URL
     ? { baseUrl: OPENROUTER_BASE_URL }
     : {};
   if (isOmp()) {
@@ -134,7 +132,7 @@ export function buildStandaloneProviderConfig(
           )
       : undefined;
     return {
-      ...ompKeys,
+      ...baseUrlKeys,
       api: OPENROUTER_RECOVERY_API,
       streamSimple: streamOpenRouterWithRecovery,
       headers: {
@@ -146,6 +144,7 @@ export function buildStandaloneProviderConfig(
     };
   }
   return {
+    ...baseUrlKeys,
     models: models ?? [],
     // Under pi registration is per-provider with the built-in id.
     api: "openai-completions",

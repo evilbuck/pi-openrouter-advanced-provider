@@ -5,3 +5,6 @@ package-lock.json
 
 # local context planning - so as not to accidentally pollute other branches
 .context
+
+# local agent harness config
+.omp/

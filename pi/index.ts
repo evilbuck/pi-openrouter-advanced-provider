@@ -136,10 +136,10 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   const selectionInFlight = new Map<string, Promise<SelectionResult | undefined>>();
 
   async function selectProvider(modelId: string, apiKey: string | undefined, force = false): Promise<SelectionResult | undefined> {
-    if (!selectionTuning.enabled) return undefined; // OpenRouter default routing
+    if (!selectionTuning.enabled) return undefined;
     if (!modelId || modelId.startsWith("~") || modelId.startsWith("openrouter/")) return undefined;
     if (isVariantModelId(modelId)) return undefined;
-    if (requestConfig.models?.has(modelId)) return undefined; // config override bypasses the algorithm
+    if (requestConfig.models?.has(modelId)) return undefined;
 
     const cached = force ? undefined : getSelection(modelId);
     if (cached) return cached.result;
@@ -149,18 +149,17 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
     const promise = (async () => {
       let permaslug = (await fetchPermaslugMap(force)).get(modelId);
-      // The map caches for 24h but the account catalog refreshes per session:
-      // a model added after the map was loaded would never select. On a miss,
-      // refetch the map once if it is older than 10 minutes.
       if (!permaslug && permaslugCacheAge() > 10 * 60 * 1000) {
         invalidatePermaslugCache();
         permaslug = (await fetchPermaslugMap()).get(modelId);
       }
+
       if (!permaslug) return undefined;
       const [endpoints, toolRates] = await Promise.all([
         fetchEndpointStats(permaslug),
         fetchToolCallErrorRates(permaslug).catch(() => new Map<string, number>()),
       ]);
+
       return scoreProviders(modelId, endpoints, toolRates, selectionTuning);
     })()
       .then((result) => {
@@ -247,7 +246,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
   //      single pick, allow_fallbacks lets OpenRouter balance the rest, and
   //      stunted-context providers are ignored so fallbacks cannot land there
   //   4. nothing — the request goes out with OpenRouter's default routing
-  pi.on("before_provider_request", (event) => {
+  pi.on("before_provider_request", async (event) => {
     const payload = event.payload;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
     const model = (payload as Record<string, unknown>).model;
@@ -285,9 +284,8 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     const override = requestConfig.models?.get(model);
     // With selection disabled the JIT pick is skipped entirely — the config
     // layers above still apply, and OpenRouter's default routing serves.
-    const selection = selectionTuning.enabled
-      ? (getSelection(model) ?? getStaleSelection(model))
-      : undefined;
+    const selected = selectionTuning.enabled && !getSelection(model) ? await selectProvider(model, undefined, false) : undefined;
+    const selection = selected ? { result: selected } : selectionTuning.enabled ? (getSelection(model) ?? getStaleSelection(model)) : undefined;
     if (override) {
       result = mergeRequestConfig(base, override) as Record<string, unknown>;
     } else {
@@ -490,7 +488,8 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       if (!selectionTuning.enabled) return; // no stats fetches when selection is off
       const model = ctx.model ?? (ctx as any).getModel?.();
       if (!model) return;
-      const id = String((model as any).id ?? model);
+      const modelRecord = model as { id?: unknown };
+      const id = typeof modelRecord.id === "string" ? modelRecord.id : String(model);
       if (getSelection(id)) return;
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
       await prewarm(id, apiKey, ctx);
